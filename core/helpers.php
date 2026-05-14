@@ -125,4 +125,22 @@ function column_exists(PDO $pdo, string $tableName, string $columnName): bool
     }
 }
 
+/** Billed amount per service row (same logic as dashboard / recent orders). */
+function service_order_amount_expr(PDO $pdo): string
+{
+    $parts = [];
+    if (column_exists($pdo, 'services', 'grand_total')) {
+        $parts[] = 's.grand_total';
+    }
+    if (column_exists($pdo, 'services', 'total_bill')) {
+        $parts[] = 's.total_bill';
+    }
+    if (column_exists($pdo, 'invoices', 'service_id')) {
+        $parts[] = 'i.total_amount';
+    }
+    $parts[] = '(s.quantity * s.price)';
+
+    return 'COALESCE(' . implode(', ', $parts) . ')';
+}
+
 require_once __DIR__ . '/i18n.php';

@@ -18,7 +18,8 @@ try {
         $available = 0;
     }
     $pending = (int) $pdo->query("SELECT COUNT(*) FROM invoices WHERE status <> 'Paid'")->fetchColumn();
-    $todaySales = (float) $pdo->query("SELECT COALESCE(SUM(amount),0) FROM payments WHERE payment_date = CURDATE()")->fetchColumn();
+    $orderExpr = service_order_amount_expr($pdo);
+    $todaySales = (float) $pdo->query("SELECT COALESCE(SUM({$orderExpr}),0) FROM services s LEFT JOIN invoices i ON i.service_id = s.id WHERE s.date = CURDATE()")->fetchColumn();
     $pendingAmount = (float) $pdo->query("SELECT COALESCE(SUM(remaining_amount),0) FROM invoices WHERE status <> 'Paid'")->fetchColumn();
 
     echo json_encode([

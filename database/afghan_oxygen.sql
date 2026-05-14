@@ -3,7 +3,7 @@
 -- https://www.phpmyadmin.net/
 --
 -- Host: 127.0.0.1
--- Generation Time: May 06, 2026 at 03:51 PM
+-- Generation Time: May 14, 2026 at 03:45 PM
 -- Server version: 10.4.32-MariaDB
 -- PHP Version: 8.2.12
 
@@ -41,11 +41,7 @@ CREATE TABLE `customers` (
 --
 
 INSERT INTO `customers` (`id`, `name`, `phone`, `address`, `current_cylinder_balance`, `created_at`) VALUES
-(6, 'Hamza', '023423423', '', 1, '2026-05-03 06:15:47'),
-(8, 'Arif', '0234234324', '', 0, '2026-05-04 09:50:22'),
-(9, 'Imtiaz Khan', '', 'Karkhano Peshawar', 1, '2026-05-04 14:22:28'),
-(10, 'Kamran Khan', '043432343243', 'Karkhano Peshawar lahore', 0, '2026-05-05 11:53:43'),
-(11, 'Waris', '023432432', 'addresssss yeh ian', 0, '2026-05-05 11:56:09');
+(14, 'Amir Khan', '0342342', 'asfjlsk', 0, '2026-05-14 13:13:54');
 
 -- --------------------------------------------------------
 
@@ -67,8 +63,7 @@ CREATE TABLE `customer_cylinder_balance` (
 --
 
 INSERT INTO `customer_cylinder_balance` (`id`, `customer_id`, `cylinder_size`, `balance_qty`, `created_at`, `updated_at`) VALUES
-(17, 6, 'Small', 1, '2026-05-04 13:37:39', '2026-05-04 13:37:39'),
-(18, 9, 'Small', 1, '2026-05-04 14:23:21', '2026-05-04 14:23:21');
+(23, 14, 'Small', 0, '2026-05-14 13:15:35', '2026-05-14 13:15:35');
 
 -- --------------------------------------------------------
 
@@ -90,7 +85,7 @@ CREATE TABLE `cylinders` (
 --
 
 INSERT INTO `cylinders` (`id`, `total`, `available`, `issued`, `empty`, `updated_at`) VALUES
-(8, 18.00, 15.00, 3, 1, '2026-05-04 14:23:21');
+(10, 8.00, 7.00, 1, 1, '2026-05-14 13:15:35');
 
 -- --------------------------------------------------------
 
@@ -113,9 +108,9 @@ CREATE TABLE `cylinder_stock_by_type` (
 --
 
 INSERT INTO `cylinder_stock_by_type` (`id`, `cylinder_type`, `total`, `available`, `available_pressure`, `created_at`, `updated_at`) VALUES
-(1138, 'Small', 7.00, 4.00, 22000.00, '2026-05-04 12:03:43', '2026-05-04 14:23:21'),
-(1139, 'Medium', 6.00, 6.00, 42000.00, '2026-05-04 12:03:43', '2026-05-04 12:56:46'),
-(1140, 'Large', 5.00, 5.00, 60000.00, '2026-05-04 12:03:43', '2026-05-04 12:32:12');
+(1684, 'Small', 5.00, 4.00, 99000.00, '2026-05-14 12:49:59', '2026-05-14 13:15:35'),
+(1685, 'Medium', 1.00, 1.00, 6000.00, '2026-05-14 12:49:59', '2026-05-14 13:10:46'),
+(1686, 'Large', 2.00, 2.00, 24000.00, '2026-05-14 12:49:59', '2026-05-14 13:10:46');
 
 -- --------------------------------------------------------
 
@@ -139,8 +134,7 @@ CREATE TABLE `invoices` (
 --
 
 INSERT INTO `invoices` (`id`, `customer_id`, `service_id`, `total_amount`, `paid_amount`, `remaining_amount`, `status`, `created_at`) VALUES
-(10, 6, 10, 1000.00, 1000.00, 0.00, 'Paid', '2026-05-04 13:37:39'),
-(11, 9, 11, 8000.00, 8000.00, 0.00, 'Paid', '2026-05-04 14:23:21');
+(16, 14, 16, 2000.00, 2000.00, 0.00, 'Paid', '2026-05-14 13:15:35');
 
 -- --------------------------------------------------------
 
@@ -169,10 +163,9 @@ CREATE TABLE `ledger` (
 --
 
 INSERT INTO `ledger` (`id`, `customer_id`, `debit`, `credit`, `balance`, `date`, `description`, `cylinders_sent`, `cylinders_received`, `cylinders_baqi`, `reference_type`, `reference_id`, `created_at`) VALUES
-(17, 6, 1000.00, 0.00, 1000.00, '2026-05-04', 'Cylinder exchange & gas refill order', 2, 1, 1, 'service', 10, '2026-05-04 13:37:39'),
-(18, 6, 0.00, 800.00, 200.00, '2026-05-04', 'Payment for Order #10', 0, 0, 0, 'service', 10, '2026-05-04 13:37:39'),
-(19, 9, 8000.00, 0.00, 8000.00, '2026-05-04', 'Cylinder exchange & gas refill order', 1, 0, 1, 'service', 11, '2026-05-04 14:23:21'),
-(20, 9, 0.00, 8000.00, 0.00, '2026-05-04', 'Payment for Order #11', 0, 0, 0, 'service', 11, '2026-05-04 14:23:21');
+(31, 14, 2000.00, 0.00, 2000.00, '2026-05-14', 'Cylinder exchange & gas refill order dfds', 1, 1, 0, 'service', 16, '2026-05-14 13:15:35'),
+(32, 14, 0.00, 1500.00, 500.00, '2026-05-14', 'Payment for Order #16 - Cylinder exchange & gas refill order dfds', 0, 0, 0, 'service', 16, '2026-05-14 13:15:35'),
+(33, 14, 0.00, 500.00, 0.00, '2026-05-14', 'Payment received for INV-16', 0, 0, 0, 'payment', 22, '2026-05-14 13:17:24');
 
 -- --------------------------------------------------------
 
@@ -193,9 +186,8 @@ CREATE TABLE `payments` (
 --
 
 INSERT INTO `payments` (`id`, `invoice_id`, `amount`, `payment_date`, `created_at`) VALUES
-(12, 10, 800.00, '2026-05-04', '2026-05-04 13:37:39'),
-(13, 10, 200.00, '2026-05-04', '2026-05-04 13:39:09'),
-(14, 11, 8000.00, '2026-05-04', '2026-05-04 14:23:21');
+(21, 16, 1500.00, '2026-05-14', '2026-05-14 13:15:35'),
+(22, 16, 500.00, '2026-05-14', '2026-05-14 13:17:24');
 
 -- --------------------------------------------------------
 
@@ -219,7 +211,7 @@ CREATE TABLE `refill_discrepancy` (
 --
 
 INSERT INTO `refill_discrepancy` (`id`, `supplier_id`, `transaction_id`, `sent_quantity`, `received_fully`, `difference_quantity`, `notes`, `created_at`) VALUES
-(10, 14, 17, 14, 15, -1, 'Dispatch vs receipt cylinder count', '2026-05-04 12:32:12');
+(12, 17, 21, 12, 8, 4, 'Dispatch vs receipt cylinder count', '2026-05-14 13:10:46');
 
 -- --------------------------------------------------------
 
@@ -264,8 +256,7 @@ CREATE TABLE `services` (
 --
 
 INSERT INTO `services` (`id`, `customer_id`, `service_type`, `quantity`, `price`, `total_bill`, `service_charges`, `previous_balance`, `grand_total`, `paid_amount`, `remaining_balance`, `notes`, `date`, `created_at`) VALUES
-(10, 6, 'refill', 2, 1000.00, 1000.00, 0.00, 0.00, 1000.00, 1000.00, 0.00, 'Cylinder exchange & gas refill order', '2026-05-04', '2026-05-04 13:37:39'),
-(11, 9, 'refill', 1, 8000.00, 8000.00, 0.00, 0.00, 8000.00, 8000.00, 0.00, 'Cylinder exchange & gas refill order', '2026-05-04', '2026-05-04 14:23:21');
+(16, 14, 'refill', 1, 2000.00, 2000.00, 0.00, 0.00, 2000.00, 2000.00, 0.00, 'Cylinder exchange & gas refill order dfds', '2026-05-14', '2026-05-14 13:15:35');
 
 -- --------------------------------------------------------
 
@@ -294,8 +285,7 @@ CREATE TABLE `service_cylinder_rows` (
 --
 
 INSERT INTO `service_cylinder_rows` (`id`, `service_id`, `cylinder_size`, `sent_qty`, `received_qty`, `sale_units`, `baqi_qty`, `rate`, `billing_basis`, `sale_pressure`, `sold_pressure_total`, `total_amount`, `created_at`) VALUES
-(9, 10, 'Small', 2, 1, 2, 1, 500.00, 'quantity', 1000.00, 2000.00, 1000.00, '2026-05-04 13:37:39'),
-(10, 11, 'Small', 1, 0, 1, 1, 8000.00, 'quantity', 3000.00, 3000.00, 8000.00, '2026-05-04 14:23:21');
+(15, 16, 'Small', 1, 1, 1, 0, 2000.00, 'quantity', 1000.00, 1000.00, 2000.00, '2026-05-14 13:15:35');
 
 -- --------------------------------------------------------
 
@@ -344,8 +334,7 @@ CREATE TABLE `suppliers` (
 --
 
 INSERT INTO `suppliers` (`id`, `name`, `contact_person`, `phone`, `email`, `address`, `opening_balance`, `created_at`) VALUES
-(14, 'Lahore Oxygen Limited', 'Zeeshan', '2343242', NULL, '', 0.00, '2026-05-04 11:19:34'),
-(15, 'Afghan limited', 'amjid', '3243244', NULL, '', 0.00, '2026-05-04 12:55:44');
+(17, 'A to Z Oxygen Company', 'Asad', '023442323', NULL, '', 0.00, '2026-05-14 13:07:19');
 
 -- --------------------------------------------------------
 
@@ -371,18 +360,9 @@ CREATE TABLE `supplier_ledger` (
 --
 
 INSERT INTO `supplier_ledger` (`id`, `supplier_id`, `debit`, `credit`, `balance`, `reference_type`, `reference_id`, `description`, `entry_date`, `created_at`) VALUES
-(95, 14, 42499.90, 0.00, 42499.90, 'purchase', 17, 'Purchase #SP-17 — Sent: Small (Qty: 5) | Medium (Qty: 5) | Large (Qty: 4) — Received: Small (Qty: 5 @ 5000 PSI @  1,000.00/u) | Medium (Qty: 5 @ 8000 PSI @  2,499.98/u) | Large (Qty: 5 @ 12000 PSI @  5,000.00/u) — Avg unit:  2,833.33', '2026-05-04', '2026-05-04 12:32:12'),
-(96, 14, 0.00, 20000.00, 22499.90, 'payment', 17, 'Installment #SP-17 (Cash) —  20,000.00 toward refill purchase', '2026-05-04', '2026-05-04 12:32:12'),
-(97, 14, 2999.99, 0.00, 25499.89, 'purchase', 18, 'Purchase #SP-18 — Sent: Small (Qty: 1) | Medium (Qty: 1) — Received: Small (Qty: 1 @ 1000 PSI @  1,000.00/u) | Medium (Qty: 1 @ 2000 PSI @  1,999.99/u) — Avg unit:  1,500.00', '2026-05-04', '2026-05-04 12:56:46'),
-(98, 14, 0.00, 499.98, 24999.91, 'payment', 18, 'Installment #SP-18 (Cash) —  499.98 toward refill purchase', '2026-05-04', '2026-05-04 12:56:46'),
-(99, 14, 0.00, 100.00, 24899.91, 'payment', 18, 'Payment received via ledger view', '2026-05-04', '2026-05-04 13:12:13'),
-(100, 14, 0.00, 100.00, 24799.91, 'payment', 18, 'Payment received via ledger view', '2026-05-04', '2026-05-04 13:13:39'),
-(101, 14, 0.00, 200.00, 24599.91, 'payment', 18, 'Payment received via ledger view', '2026-05-05', '2026-05-04 13:14:04'),
-(102, 14, 0.00, 2100.00, 22499.91, 'payment', 18, 'Payment received via ledger view', '2026-05-07', '2026-05-04 13:19:32'),
-(103, 14, 0.00, 0.01, 22499.90, 'payment', 18, 'Payment received via ledger view', '2026-05-08', '2026-05-04 13:19:50'),
-(104, 15, 2000.00, 0.00, 2000.00, 'purchase', 19, 'Purchase #SP-19 — Sent: Small (Qty: 1 @ 100 PSI) — Received: Small (Qty: 1 @ 1000 PSI @  2,000.00/u) — Avg unit:  2,000.00', '2026-05-04', '2026-05-04 13:27:55'),
-(105, 15, 0.00, 500.00, 1500.00, 'payment', 19, 'Installment #SP-19 (Cash) —  500.00 toward refill purchase', '2026-05-04', '2026-05-04 13:27:55'),
-(106, 15, 0.00, 1500.00, 0.00, 'payment', 19, 'Payment received via ledger view', '2026-05-08', '2026-05-04 13:28:26');
+(109, 17, 121000.00, 0.00, 121000.00, 'purchase', 21, 'Purchase #SP-21 — Sent: Small (Qty: 5) | Medium (Qty: 2) | Large (Qty: 5) — Received: Small (Qty: 5 @ 20000 PSI @  20,000.00/u) | Medium (Qty: 1 @ 6000 PSI @  5,000.00/u) | Large (Qty: 2 @ 12000 PSI @  8,000.00/u) — Avg unit:  15,125.00', '2026-05-14', '2026-05-14 13:10:46'),
+(110, 17, 0.00, 100000.00, 21000.00, 'payment', 21, 'Installment #SP-21 (Cash) —  100,000.00 toward refill purchase', '2026-05-14', '2026-05-14 13:10:46'),
+(111, 17, 0.00, 21000.00, 0.00, 'payment', 21, 'Payment received via ledger view', '2026-05-14', '2026-05-14 13:13:10');
 
 -- --------------------------------------------------------
 
@@ -405,15 +385,8 @@ CREATE TABLE `supplier_payments` (
 --
 
 INSERT INTO `supplier_payments` (`id`, `supplier_id`, `transaction_id`, `amount`, `payment_type`, `payment_date`, `created_at`) VALUES
-(26, 14, 17, 20000.00, 'Cash', '2026-05-04', '2026-05-04 12:32:12'),
-(27, 14, 18, 499.98, 'Cash', '2026-05-04', '2026-05-04 12:56:46'),
-(28, 14, 18, 100.00, 'Cash', '2026-05-04', '2026-05-04 13:12:13'),
-(29, 14, 18, 100.00, 'Cash', '2026-05-04', '2026-05-04 13:13:39'),
-(30, 14, 18, 200.00, 'Cash', '2026-05-05', '2026-05-04 13:14:04'),
-(31, 14, 18, 2100.00, 'Cash', '2026-05-07', '2026-05-04 13:19:32'),
-(32, 14, 18, 0.01, 'Cash', '2026-05-08', '2026-05-04 13:19:50'),
-(33, 15, 19, 500.00, 'Cash', '2026-05-04', '2026-05-04 13:27:55'),
-(34, 15, 19, 1500.00, 'Cash', '2026-05-08', '2026-05-04 13:28:26');
+(35, 17, 21, 100000.00, 'Cash', '2026-05-14', '2026-05-14 13:10:46'),
+(36, 17, 21, 21000.00, 'Cash', '2026-05-14', '2026-05-14 13:13:10');
 
 -- --------------------------------------------------------
 
@@ -433,7 +406,8 @@ CREATE TABLE `supplier_pending_cylinders` (
 --
 
 INSERT INTO `supplier_pending_cylinders` (`supplier_id`, `cylinder_type`, `pending_count`, `updated_at`) VALUES
-(14, 'Large', -1, '2026-05-04 12:32:12');
+(17, 'Medium', 1, '2026-05-14 13:10:46'),
+(17, 'Large', 3, '2026-05-14 13:10:46');
 
 -- --------------------------------------------------------
 
@@ -458,12 +432,9 @@ CREATE TABLE `supplier_refill_breakdown` (
 --
 
 INSERT INTO `supplier_refill_breakdown` (`id`, `transaction_id`, `refill_cylinder_type`, `status_label`, `quantity`, `pressure_received`, `line_unit_price`, `inventory_qty`, `created_at`) VALUES
-(29, 17, 'Small', 'Refill Receipt', 5, 5000.00, 1000.00, 5.00, '2026-05-04 12:32:12'),
-(30, 17, 'Medium', 'Refill Receipt', 5, 8000.00, 2499.98, 5.00, '2026-05-04 12:32:12'),
-(31, 17, 'Large', 'Refill Receipt', 5, 12000.00, 5000.00, 5.00, '2026-05-04 12:32:12'),
-(32, 18, 'Small', 'Refill Receipt', 1, 1000.00, 1000.00, 1.00, '2026-05-04 12:56:46'),
-(33, 18, 'Medium', 'Refill Receipt', 1, 2000.00, 1999.99, 1.00, '2026-05-04 12:56:46'),
-(34, 19, 'Small', 'Refill Receipt', 1, 1000.00, 2000.00, 1.00, '2026-05-04 13:27:55');
+(38, 21, 'Small', 'Refill Receipt', 5, 20000.00, 20000.00, 5.00, '2026-05-14 13:10:46'),
+(39, 21, 'Medium', 'Refill Receipt', 1, 6000.00, 5000.00, 1.00, '2026-05-14 13:10:46'),
+(40, 21, 'Large', 'Refill Receipt', 2, 12000.00, 8000.00, 2.00, '2026-05-14 13:10:46');
 
 -- --------------------------------------------------------
 
@@ -504,9 +475,7 @@ CREATE TABLE `supplier_transactions` (
 --
 
 INSERT INTO `supplier_transactions` (`id`, `supplier_id`, `sent_quantity`, `date_sent`, `sent_pressure`, `sent_qty_small`, `sent_qty_medium`, `sent_qty_large`, `sent_pressure_small`, `sent_pressure_medium`, `sent_pressure_large`, `cylinder_type`, `quantity`, `total_received`, `inventory_quantity`, `received_fully_quantity`, `received_pressure_total`, `unit_price`, `total_amount`, `paid_amount`, `remaining_amount`, `payment_type`, `payment_status`, `transaction_date`, `created_at`) VALUES
-(17, 14, 14, '2026-05-04', NULL, 5, 5, 4, NULL, NULL, NULL, 'Mixed', 15, 15, 15.00, 15, 125000.00, 2833.33, 42499.90, 20000.00, 22499.90, 'Cash', 'PARTIAL', '2026-05-04', '2026-05-04 12:32:12'),
-(18, 14, 2, '2026-05-04', NULL, 1, 1, 0, NULL, NULL, NULL, 'Mixed', 2, 2, 2.00, 2, 3000.00, 1500.00, 2999.99, 2999.99, 0.00, 'Cash', 'PAID', '2026-05-04', '2026-05-04 12:56:46'),
-(19, 15, 1, '2026-05-04', 100.00, 1, 0, 0, 100.00, NULL, NULL, 'Small', 1, 1, 1.00, 1, 1000.00, 2000.00, 2000.00, 2000.00, 0.00, 'Cash', 'PAID', '2026-05-04', '2026-05-04 13:27:55');
+(21, 17, 12, '2026-05-14', 0.00, 5, 2, 5, 0.00, NULL, NULL, 'Mixed', 8, 8, 8.00, 8, 130000.00, 15125.00, 121000.00, 121000.00, 0.00, 'Cash', 'PAID', '2026-05-14', '2026-05-14 13:10:46');
 
 -- --------------------------------------------------------
 
@@ -674,49 +643,49 @@ ALTER TABLE `users`
 -- AUTO_INCREMENT for table `customers`
 --
 ALTER TABLE `customers`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=12;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=15;
 
 --
 -- AUTO_INCREMENT for table `customer_cylinder_balance`
 --
 ALTER TABLE `customer_cylinder_balance`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=19;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=24;
 
 --
 -- AUTO_INCREMENT for table `cylinders`
 --
 ALTER TABLE `cylinders`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=9;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=11;
 
 --
 -- AUTO_INCREMENT for table `cylinder_stock_by_type`
 --
 ALTER TABLE `cylinder_stock_by_type`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=1489;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=1753;
 
 --
 -- AUTO_INCREMENT for table `invoices`
 --
 ALTER TABLE `invoices`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=12;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=17;
 
 --
 -- AUTO_INCREMENT for table `ledger`
 --
 ALTER TABLE `ledger`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=21;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=34;
 
 --
 -- AUTO_INCREMENT for table `payments`
 --
 ALTER TABLE `payments`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=15;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=23;
 
 --
 -- AUTO_INCREMENT for table `refill_discrepancy`
 --
 ALTER TABLE `refill_discrepancy`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=11;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=13;
 
 --
 -- AUTO_INCREMENT for table `reminders`
@@ -728,13 +697,13 @@ ALTER TABLE `reminders`
 -- AUTO_INCREMENT for table `services`
 --
 ALTER TABLE `services`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=12;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=17;
 
 --
 -- AUTO_INCREMENT for table `service_cylinder_rows`
 --
 ALTER TABLE `service_cylinder_rows`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=11;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=16;
 
 --
 -- AUTO_INCREMENT for table `settings`
@@ -746,31 +715,31 @@ ALTER TABLE `settings`
 -- AUTO_INCREMENT for table `suppliers`
 --
 ALTER TABLE `suppliers`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=16;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=18;
 
 --
 -- AUTO_INCREMENT for table `supplier_ledger`
 --
 ALTER TABLE `supplier_ledger`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=107;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=112;
 
 --
 -- AUTO_INCREMENT for table `supplier_payments`
 --
 ALTER TABLE `supplier_payments`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=35;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=37;
 
 --
 -- AUTO_INCREMENT for table `supplier_refill_breakdown`
 --
 ALTER TABLE `supplier_refill_breakdown`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=35;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=41;
 
 --
 -- AUTO_INCREMENT for table `supplier_transactions`
 --
 ALTER TABLE `supplier_transactions`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=20;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=22;
 
 --
 -- AUTO_INCREMENT for table `users`

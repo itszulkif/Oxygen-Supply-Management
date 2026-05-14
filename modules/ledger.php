@@ -546,6 +546,8 @@ $customerDetail = null;
 $customerDetailInvoices = [];
 $customerDetailPayments = [];
 $customerDetailLedger = [];
+$ledgerScrollToPayment = false;
+$ledgerPreselectInvoiceId = 0;
 if ($entity === 'customer' && $viewCustomerId > 0) {
     $st = $pdo->prepare('SELECT id, name, phone, address FROM customers WHERE id = ?');
     $st->execute([$viewCustomerId]);
@@ -560,6 +562,17 @@ if ($entity === 'customer' && $viewCustomerId > 0) {
         $st = $pdo->prepare('SELECT date, description, debit, credit, balance FROM ledger WHERE customer_id = ? ORDER BY date DESC, id DESC');
         $st->execute([$viewCustomerId]);
         $customerDetailLedger = $st->fetchAll();
+
+        $ledgerScrollToPayment = isset($_GET['focus']) && (string) $_GET['focus'] === 'payment';
+        $wantInvoice = (int) ($_GET['pay_invoice'] ?? 0);
+        if ($wantInvoice > 0) {
+            foreach ($customerDetailInvoices as $inv) {
+                if ((int) ($inv['id'] ?? 0) === $wantInvoice && (float) ($inv['remaining_amount'] ?? 0) > 0.00001) {
+                    $ledgerPreselectInvoiceId = $wantInvoice;
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -782,7 +795,7 @@ ob_start();
         <div><span class="text-slate-500"><?= e(__('customers.label_address')) ?>:</span> <?= e((string) ($customerDetail['address'] ?? '')) ?></div>
         <div><span class="text-slate-500"><?= e(__('ledger.total_invoices')) ?>:</span> <?= count($customerDetailInvoices) ?></div>
     </div>
-    <div class="border rounded-lg p-3 mb-4">
+    <div id="ledgerCustomerPayment" class="border rounded-lg p-3 mb-4">
         <h4 class="font-semibold mb-2"><?= e(__('ledger.add_due_payment')) ?></h4>
         <form method="post" class="grid grid-cols-1 md:grid-cols-5 gap-2">
             <?php if (i18n_locale() === 'ps'): ?><input type="hidden" name="lang" value="ps"><?php endif; ?>
@@ -791,7 +804,7 @@ ob_start();
             <select name="invoice_id" class="border rounded-lg px-3 py-2 text-sm" required>
                 <option value=""><?= e(__('ledger.select_due_invoice')) ?></option>
                 <?php foreach ($customerDetailInvoices as $inv): if ((float) ($inv['remaining_amount'] ?? 0) <= 0.00001) continue; ?>
-                    <option value="<?= (int) $inv['id'] ?>">INV-<?= (int) $inv['id'] ?> (<?= e(__('status.due')) ?>: <?= e(format_currency((float) $inv['remaining_amount'])) ?>)</option>
+                    <option value="<?= (int) $inv['id'] ?>"<?= $ledgerPreselectInvoiceId === (int) $inv['id'] ? ' selected' : '' ?>>INV-<?= (int) $inv['id'] ?> (<?= e(__('status.due')) ?>: <?= e(format_currency((float) $inv['remaining_amount'])) ?>)</option>
                 <?php endforeach; ?>
             </select>
             <input type="number" name="amount" step="0.01" min="0.01" required class="border rounded-lg px-3 py-2 text-sm" placeholder="<?= e(__('payments.amount')) ?>">
@@ -805,6 +818,20 @@ ob_start();
         <div class="border rounded-lg p-3"><h4 class="font-semibold mb-2"><?= e(__('ledger.ledger_transactions')) ?></h4><?php foreach ($customerDetailLedger as $l): ?><p class="text-sm mb-1"><?= e(format_date_pk((string) $l['date'])) ?> | D <?= e(format_currency((float) $l['debit'])) ?> | C <?= e(format_currency((float) $l['credit'])) ?> | B <?= e(format_currency((float) $l['balance'])) ?></p><?php endforeach; ?><?php if (!$customerDetailLedger): ?><p class="text-sm text-slate-500"><?= e(__('ledger.no_ledger_transactions')) ?></p><?php endif; ?></div>
     </div>
 </section>
+<?php if ($ledgerScrollToPayment): ?>
+<script>
+(() => {
+    const el = document.getElementById('ledgerCustomerPayment');
+    if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        const sel = el.querySelector('select[name="invoice_id"]');
+        if (sel) {
+            setTimeout(() => sel.focus(), 400);
+        }
+    }
+})();
+</script>
+<?php endif; ?>
 <?php endif; ?>
 
 <?php if ($entity === 'supplier' && $supplierDetail): ?>
