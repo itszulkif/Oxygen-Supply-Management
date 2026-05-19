@@ -88,16 +88,22 @@ function service_type_label(string $type): string
     return $t !== $k ? $t : ucfirst($type);
 }
 
-/** Cylinder size labels (supplier/inventory): Small / Medium / Large / Mixed */
-function cylinder_size_label(string $size): string
+/** Internal DB key for the single operational cylinder type (legacy ENUM value). */
+function standard_cylinder_size(): string
 {
-    return match ($size) {
-        'Small' => __('cyl.small'),
-        'Medium' => __('cyl.medium'),
-        'Large' => __('cyl.large'),
-        'Mixed' => __('cyl.mixed'),
-        default => $size,
-    };
+    return 'Small';
+}
+
+/** Map any stored cylinder type to the single operational type. */
+function normalize_cylinder_type(?string $size): string
+{
+    return standard_cylinder_size();
+}
+
+/** User-facing label — never shows Small/Medium/Large. */
+function cylinder_size_label(?string $size = null): string
+{
+    return __('cyl.standard');
 }
 
 /** Supplier transaction payment_status (PAID / PARTIAL / DUE) */

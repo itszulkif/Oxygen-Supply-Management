@@ -15,12 +15,12 @@ function render_layout(string $title, string $content, array $options = []): voi
     $isRtl = i18n_is_rtl();
     $nav = [
         'dashboard' => ['label' => __('nav.dashboard'), 'key' => 'dashboard', 'icon' => 'M3 13h18M3 6h18M3 20h18'],
+        'cash' => ['label' => __('nav.cash'), 'key' => 'cash', 'icon' => 'M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z'],
         'suppliers' => ['label' => __('nav.suppliers'), 'key' => 'suppliers', 'icon' => 'M3 7h18M6 7v13a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2V7M8 7V5a4 4 0 0 1 8 0v2'],
         'customers' => ['label' => __('nav.customers'), 'key' => 'customers', 'icon' => 'M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2M9 7a4 4 0 1 0 0-8 4 4 0 0 0 0 8m8 14v-2a4 4 0 0 0-3-3.87'],
         'services' => ['label' => __('nav.services'), 'key' => 'services', 'icon' => 'M9 12h6M9 16h6M5 3h14a2 2 0 0 1 2 2v14l-4-3H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2'],
+        'orders' => ['label' => __('nav.orders'), 'key' => 'orders', 'icon' => 'M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2M9 5a2 2 0 0 0 2 2h2a2 2 0 0 0 2-2M9 5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2'],
         'ledger' => ['label' => __('nav.ledger'), 'key' => 'ledger', 'icon' => 'M4 5h16M4 10h16M4 15h10M4 20h10'],
-        'customer_reports' => ['label' => __('nav.customer_reports'), 'key' => 'customer_reports', 'icon' => 'M4 19h16M7 16V8M12 16V5M17 16v-3'],
-        'supplier_reports' => ['label' => __('nav.supplier_reports'), 'key' => 'supplier_reports', 'icon' => 'M4 19h16M7 16V8M12 16V5M17 16v-3'],
         'settings' => ['label' => __('nav.settings'), 'key' => 'settings', 'icon' => 'M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6m7.4-3a7.4 7.4 0 0 0-.13-1.35l2.11-1.65-2-3.46-2.54 1a7.44 7.44 0 0 0-2.34-1.35l-.38-2.7H9.84l-.38 2.7a7.44 7.44 0 0 0-2.34 1.35l-2.54-1-2 3.46 2.11 1.65A7.4 7.4 0 0 0 4.6 12c0 .46.05.91.13 1.35l-2.11 1.65 2 3.46 2.54-1c.7.58 1.49 1.03 2.34 1.35l.38 2.7h4.32l.38-2.7c.85-.32 1.64-.77 2.34-1.35l2.54 1 2-3.46-2.11-1.65c.08-.44.13-.89.13-1.35'],
     ];
     $langEnUrl = e(i18n_switch_url('en'));
@@ -320,6 +320,25 @@ function render_layout(string $title, string $content, array $options = []): voi
                     modal.classList.remove('flex');
                 });
             });
+
+            window.OxygenFinance = (() => {
+                const channel = typeof BroadcastChannel !== 'undefined'
+                    ? new BroadcastChannel('afghan-oxygen-finance')
+                    : null;
+                const notify = (detail) => {
+                    if (channel) {
+                        channel.postMessage(detail);
+                    }
+                    window.dispatchEvent(new CustomEvent('oxygen:finance-updated', { detail }));
+                };
+                const onUpdated = (fn) => {
+                    window.addEventListener('oxygen:finance-updated', (event) => fn(event.detail));
+                    if (channel) {
+                        channel.onmessage = (event) => fn(event.data);
+                    }
+                };
+                return { notify, onUpdated };
+            })();
 
             window.App = window.App || {};
             window.App.ajaxForm = (form, options = {}) => {

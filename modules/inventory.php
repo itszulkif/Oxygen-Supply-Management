@@ -64,27 +64,24 @@ if ($hasServicesTable) {
 ob_start();
 ?>
 <?php
-$sizeSplit = [
-    'Small' => ['count' => 0, 'pressure' => 0.0],
-    'Medium' => ['count' => 0, 'pressure' => 0.0],
-    'Large' => ['count' => 0, 'pressure' => 0.0],
-];
+$cylinderStockCount = 0;
+$cylinderStockPressure = 0.0;
 if ($hasTypedStockTable) {
-    $typedRows = $pdo->query("SELECT cylinder_type, available, available_pressure FROM cylinder_stock_by_type")->fetchAll();
-    foreach ($typedRows as $typedRow) {
-        $type = (string) ($typedRow['cylinder_type'] ?? '');
-        if (!array_key_exists($type, $sizeSplit)) {
-            continue;
-        }
-        $sizeSplit[$type]['count'] = max(0, (int) round((float) ($typedRow['available'] ?? 0)));
-        $sizeSplit[$type]['pressure'] = max(0, (float) ($typedRow['available_pressure'] ?? 0));
+    $stdType = standard_cylinder_size();
+    $typedStmt = $pdo->prepare('SELECT available, available_pressure FROM cylinder_stock_by_type WHERE cylinder_type = ? LIMIT 1');
+    $typedStmt->execute([$stdType]);
+    $typedRow = $typedStmt->fetch();
+    if ($typedRow) {
+        $cylinderStockCount = max(0, (int) round((float) ($typedRow['available'] ?? 0)));
+        $cylinderStockPressure = max(0, (float) ($typedRow['available_pressure'] ?? 0));
+    } else {
+        $sumStmt = $pdo->query('SELECT COALESCE(SUM(available), 0) AS c, COALESCE(SUM(available_pressure), 0) AS p FROM cylinder_stock_by_type');
+        $sumRow = $sumStmt->fetch();
+        $cylinderStockCount = max(0, (int) round((float) ($sumRow['c'] ?? 0)));
+        $cylinderStockPressure = max(0, (float) ($sumRow['p'] ?? 0));
     }
 } else {
-    $sizeSplit = [
-        'Small' => ['count' => max(0, (int) floor($availableCylinders * 0.33)), 'pressure' => 0.0],
-        'Medium' => ['count' => max(0, (int) floor($availableCylinders * 0.34)), 'pressure' => 0.0],
-        'Large' => ['count' => max(0, $availableCylinders - ((int) floor($availableCylinders * 0.33) + (int) floor($availableCylinders * 0.34))), 'pressure' => 0.0],
-    ];
+    $cylinderStockCount = max(0, $availableCylinders);
 }
 ?>
 <section class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4 mb-5">
@@ -106,17 +103,13 @@ if ($hasTypedStockTable) {
     </div>
 </section>
 <section class="bg-white border border-slate-200 rounded-xl p-4 mb-5">
-    <h3 class="font-semibold mb-3">Cylinder Sizes Overview</h3>
-    <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
-        <?php foreach ($sizeSplit as $size => $sizeMeta): ?>
-            <?php $count = (int) ($sizeMeta['count'] ?? 0); $pressure = (float) ($sizeMeta['pressure'] ?? 0); ?>
-            <div class="rounded-lg border border-slate-200 p-3">
-                <p class="text-sm text-slate-500"><?= e($size) ?></p>
-                <p class="text-xl font-bold <?= $count < 10 ? 'text-danger' : 'text-primary' ?>"><?= $count ?> Cylinders</p>
-                <p class="text-xs text-slate-600 mt-1"><?= e(number_format($pressure, 2)) ?> Bar</p>
-                <?php if ($count < 10): ?><p class="text-xs text-danger">Low stock alert (&lt; 10)</p><?php endif; ?>
-            </div>
-        <?php endforeach; ?>
+    <h3 class="font-semibold mb-3"><?= e(__('cyl.standard')) ?> — <?= e(__('suppliers.stock_daka')) ?></h3>
+    <div class="rounded-lg border border-slate-200 p-3 max-w-sm">
+        <p class="text-xl font-bold <?= $cylinderStockCount < 10 ? 'text-danger' : 'text-primary' ?>"><?= (int) $cylinderStockCount ?> <?= e(__('cyl.standard')) ?></p>
+        <?php if ($hasTypedStockTable): ?>
+        <p class="text-xs text-slate-600 mt-1"><?= e(number_format($cylinderStockPressure, 2)) ?> Bar</p>
+        <?php endif; ?>
+        <?php if ($cylinderStockCount < 10): ?><p class="text-xs text-danger">Low stock alert (&lt; 10)</p><?php endif; ?>
     </div>
 </section>
 

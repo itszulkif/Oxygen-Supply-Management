@@ -2,6 +2,18 @@
 
 $pdo = db();
 
+if (($_GET['ajax'] ?? '') === 'customer_balance') {
+    header('Content-Type: application/json; charset=utf-8');
+    $cid = (int) ($_GET['customer_id'] ?? 0);
+    if ($cid <= 0) {
+        echo json_encode(['ok' => false], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    $map = customer_receivable_map($pdo, [$cid]);
+    echo json_encode(['ok' => true, 'balance' => $map[$cid] ?? ['receivable' => 0, 'receivable_formatted' => format_currency(0)]], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
 $customer_type_label = static function (string $type): string {
     return match ($type) {
         'Retail' => __('customers.retail'),
@@ -87,6 +99,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'INSERT INTO customers (' . implode(', ', $columns) . ') VALUES (' . implode(', ', $placeholders) . ')'
         );
         $stmt->execute($values);
+        $newCustomerId = (int) $pdo->lastInsertId();
+        if ($newCustomerId > 0) {
+            customer_insert_opening_ledger(
+                $pdo,
+                $newCustomerId,
+                max(0, (float) request_value('opening_balance', '0')),
+                (int) request_value('opening_cylinders', '0')
+            );
+        }
     }
     header('Location: ?module=customers&toast=' . urlencode(__('toast.customer_saved')) . i18n_lang_query());
     exit;
@@ -95,10 +116,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 $search = trim((string) ($_GET['search'] ?? ''));
 $typeFilter = trim((string) ($_GET['type'] ?? ''));
 
-$query = 'SELECT c.*,
+$outstandingExpr = table_exists($pdo, 'ledger')
+    ? '(SELECT COALESCE(l.balance, 0) FROM ledger l WHERE l.customer_id = c.id ORDER BY l.id DESC LIMIT 1)'
+    : '(SELECT COALESCE(SUM(i.remaining_amount),0) FROM invoices i WHERE i.customer_id = c.id)';
+$query = "SELECT c.*,
           (SELECT COUNT(*) FROM services s WHERE s.customer_id = c.id) AS total_orders,
-          (SELECT COALESCE(SUM(i.remaining_amount),0) FROM invoices i WHERE i.customer_id = c.id) AS outstanding
-          FROM customers c WHERE 1=1';
+          {$outstandingExpr} AS outstanding
+          FROM customers c WHERE 1=1";
 $params = [];
 if ($search !== '') {
     $query .= ' AND (c.name LIKE ? OR c.phone LIKE ?)';
@@ -140,15 +164,7 @@ if ($detailId > 0) {
     }
 }
 
-$detailOutstanding = 0.0;
-if ($detail) {
-    foreach ($rows as $r) {
-        if ((int) ($r['id'] ?? 0) === $detailId) {
-            $detailOutstanding = (float) ($r['outstanding'] ?? 0);
-            break;
-        }
-    }
-}
+$detailOutstanding = $detail ? customer_receivable_balance($pdo, $detailId) : 0.0;
 
 ob_start();
 ?>
@@ -180,14 +196,15 @@ ob_start();
                 <tr><td colspan="6" class="p-4 text-slate-500"><?= e(__('customers.empty_list')) ?></td></tr>
             <?php else: ?>
                 <?php foreach ($rows as $row): ?>
-                    <tr data-row="true" class="border-t border-slate-100">
+                    <tr data-row="true" class="border-t border-slate-100" data-customer-id="<?= (int) $row['id'] ?>">
                         <td class="px-3 py-2.5 text-start align-middle tabular-nums">C-<?= (int) $row['id'] ?></td>
                         <td class="px-3 py-2.5 text-start align-middle"><?= e($row['name']) ?></td>
                         <td class="px-3 py-2.5 text-start align-middle tabular-nums"><?= e($row['phone']) ?></td>
                         <td data-value="<?= (int) $row['total_orders'] ?>" class="px-3 py-2.5 text-end align-middle tabular-nums"><?= (int) $row['total_orders'] ?></td>
-                        <td data-value="<?= (float) $row['outstanding'] ?>" class="px-3 py-2.5 text-end align-middle tabular-nums <?= (float) $row['outstanding'] > 0 ? 'text-warning font-medium' : 'text-primary' ?>"><?= e(format_currency((float) $row['outstanding'])) ?></td>
+                        <td data-value="<?= (float) $row['outstanding'] ?>" data-customer-outstanding class="px-3 py-2.5 text-end align-middle tabular-nums <?= (float) $row['outstanding'] > 0 ? 'text-warning font-medium' : 'text-primary' ?>"><?= e(format_currency((float) $row['outstanding'])) ?></td>
                         <td class="px-3 py-2.5 text-end align-middle whitespace-nowrap">
                             <div class="inline-flex items-center justify-end gap-1.5">
+                                <a href="<?= e('?module=services&customer_id=' . (int) $row['id'] . i18n_lang_query()) ?>" class="inline-flex rounded bg-indigo-100 px-2 py-1 text-xs text-indigo-800"><?= e(__('customers.new_order')) ?></a>
                                 <a href="<?= e('?module=customers&detail=' . (int) $row['id'] . i18n_lang_query()) ?>" class="inline-flex rounded bg-emerald-100 px-2 py-1 text-xs text-primary"><?= e(__('customers.view')) ?></a>
                                 <a href="<?= e('?module=customers&edit=' . (int) $row['id'] . i18n_lang_query()) ?>" class="inline-flex rounded bg-sky-100 px-2 py-1 text-xs text-sky-700"><?= e(__('customers.edit_btn')) ?></a>
                                 <a href="<?= e('?module=customers&delete=' . (int) $row['id'] . i18n_lang_query()) ?>" class="inline-flex rounded bg-rose-100 px-2 py-1 text-xs text-rose-700" data-confirm="<?= e(__('customers.confirm_delete')) ?>"><?= e(__('common.delete')) ?></a>
@@ -224,6 +241,18 @@ ob_start();
                 <input type="text" readonly value="<?= e($customer_type_label('Retail')) ?>" class="w-full border rounded-lg p-2 bg-slate-50 text-slate-500">
             <?php endif; ?>
             <input name="notes" placeholder="<?= e(__('customers.notes')) ?>" value="<?= e((string) ($editCustomer['notes'] ?? '')) ?>" class="w-full border rounded-lg p-2">
+            <?php if ($editId <= 0): ?>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <label class="block">
+                    <span class="text-xs font-medium text-slate-600"><?= e(__('customers.opening_balance')) ?></span>
+                    <input name="opening_balance" type="number" step="0.01" min="0" placeholder="<?= e(__('customers.ph_opening_balance')) ?>" class="w-full border rounded-lg p-2 mt-1">
+                </label>
+                <label class="block">
+                    <span class="text-xs font-medium text-slate-600"><?= e(__('customers.opening_cylinders')) ?></span>
+                    <input name="opening_cylinders" type="number" step="1" placeholder="<?= e(__('customers.ph_opening_cylinders')) ?>" class="w-full border rounded-lg p-2 mt-1">
+                </label>
+            </div>
+            <?php endif; ?>
             <button class="w-full bg-primary text-white rounded-lg py-2 px-3"><?= $editId > 0 ? e(__('customers.update_btn')) : e(__('customers.add')) ?></button>
         </form>
     </div>
@@ -252,6 +281,38 @@ document.addEventListener('DOMContentLoaded', () => {
     </div>
 </section>
 <?php endif; ?>
+<script>
+(() => {
+    if (!window.OxygenFinance?.onUpdated) return;
+    const detailId = <?= (int) $detailId ?>;
+    window.OxygenFinance.onUpdated(async (payload) => {
+        const cid = Number(payload?.customerId || 0);
+        if (detailId > 0 && cid === detailId) {
+            window.location.reload();
+            return;
+        }
+        if (cid <= 0) return;
+        const row = document.querySelector(`tr[data-customer-id="${cid}"]`);
+        const cell = row?.querySelector('[data-customer-outstanding]');
+        if (!cell) return;
+        try {
+            const u = new URL(window.location.href);
+            u.searchParams.set('module', 'customers');
+            u.searchParams.set('ajax', 'customer_balance');
+            u.searchParams.set('customer_id', String(cid));
+            const res = await fetch(u.toString(), { headers: { 'X-Requested-With': 'XMLHttpRequest' } });
+            const data = await res.json();
+            if (!data.ok || !data.balance) return;
+            const rec = Number(data.balance.receivable ?? 0);
+            cell.textContent = data.balance.receivable_formatted || '';
+            cell.dataset.value = String(rec);
+            cell.classList.toggle('text-warning', rec > 0.00001);
+            cell.classList.toggle('font-medium', rec > 0.00001);
+            cell.classList.toggle('text-primary', rec <= 0.00001);
+        } catch (_) { /* ignore */ }
+    });
+})();
+</script>
 <?php
 $content = ob_get_clean();
 render_layout(__('meta.customers'), $content);

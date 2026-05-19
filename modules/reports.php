@@ -2,10 +2,11 @@
 
 declare(strict_types=1);
 
-$targetModule = (($_GET['tab'] ?? '') === 'supplier') ? 'supplier_reports' : 'customer_reports';
-redirect('?module=' . $targetModule . i18n_lang_query());
-
 $tab = trim((string) ($_GET['tab'] ?? 'monthly'));
+if ($tab === 'customer' || $tab === 'supplier') {
+    header('Location: ?module=dashboard' . i18n_lang_query());
+    exit;
+}
 if (!in_array($tab, ['monthly', 'yearly', 'customer', 'supplier'], true)) {
     $tab = 'monthly';
 }
@@ -203,12 +204,11 @@ if (($_GET['export'] ?? '') === 'csv') {
                 $st->execute([$supplierId, $supplierPeriodYear, $supplierPeriodMonth]);
             }
             fputcsv($out, []);
-            fputcsv($out, ['Purchase ID', 'Date', 'Type', 'Sent', 'Received', 'Total', 'Paid', 'Remaining', 'Status']);
+            fputcsv($out, ['Purchase ID', 'Date', 'Sent', 'Received', 'Total', 'Paid', 'Remaining', 'Status']);
             while ($r = $st->fetch()) {
                 fputcsv($out, [
                     $r['id'],
                     $r['transaction_date'],
-                    $r['cylinder_type'],
                     $r['sent_quantity'],
                     $r['total_received'],
                     $r['total_amount'],
@@ -689,8 +689,6 @@ ob_start();
     <div class="flex flex-wrap gap-2 mb-3 items-center">
         <a href="?module=reports&amp;tab=monthly&amp;month=<?= e(urlencode($month)) ?>&amp;year=<?= (int) $year ?>&amp;customer_id=<?= (int) $customerId ?>&amp;supplier_id=<?= (int) $supplierId ?>&amp;customer_period=<?= e($customerPeriod) ?>&amp;customer_month=<?= e(urlencode($customerMonth)) ?>&amp;customer_year=<?= (int) $customerYear ?>&amp;supplier_period=<?= e($supplierPeriod) ?>&amp;supplier_month=<?= e(urlencode($supplierMonth)) ?>&amp;supplier_year=<?= (int) $supplierYear ?>" class="px-3 py-2 rounded-lg text-sm <?= $tab === 'monthly' ? 'bg-primary text-white' : 'bg-slate-100' ?>">Monthly Report</a>
         <a href="?module=reports&amp;tab=yearly&amp;month=<?= e(urlencode($month)) ?>&amp;year=<?= (int) $year ?>&amp;customer_id=<?= (int) $customerId ?>&amp;supplier_id=<?= (int) $supplierId ?>&amp;customer_period=<?= e($customerPeriod) ?>&amp;customer_month=<?= e(urlencode($customerMonth)) ?>&amp;customer_year=<?= (int) $customerYear ?>&amp;supplier_period=<?= e($supplierPeriod) ?>&amp;supplier_month=<?= e(urlencode($supplierMonth)) ?>&amp;supplier_year=<?= (int) $supplierYear ?>" class="px-3 py-2 rounded-lg text-sm <?= $tab === 'yearly' ? 'bg-primary text-white' : 'bg-slate-100' ?>">Yearly Report</a>
-        <a href="?module=reports&amp;tab=customer&amp;month=<?= e(urlencode($month)) ?>&amp;year=<?= (int) $year ?>&amp;customer_id=<?= (int) $customerId ?>&amp;supplier_id=<?= (int) $supplierId ?>&amp;customer_period=<?= e($customerPeriod) ?>&amp;customer_month=<?= e(urlencode($customerMonth)) ?>&amp;customer_year=<?= (int) $customerYear ?>&amp;supplier_period=<?= e($supplierPeriod) ?>&amp;supplier_month=<?= e(urlencode($supplierMonth)) ?>&amp;supplier_year=<?= (int) $supplierYear ?>" class="px-3 py-2 rounded-lg text-sm <?= $tab === 'customer' ? 'bg-primary text-white' : 'bg-slate-100' ?>">Customer Report</a>
-        <a href="?module=reports&amp;tab=supplier&amp;month=<?= e(urlencode($month)) ?>&amp;year=<?= (int) $year ?>&amp;customer_id=<?= (int) $customerId ?>&amp;supplier_id=<?= (int) $supplierId ?>&amp;customer_period=<?= e($customerPeriod) ?>&amp;customer_month=<?= e(urlencode($customerMonth)) ?>&amp;customer_year=<?= (int) $customerYear ?>&amp;supplier_period=<?= e($supplierPeriod) ?>&amp;supplier_month=<?= e(urlencode($supplierMonth)) ?>&amp;supplier_year=<?= (int) $supplierYear ?>" class="px-3 py-2 rounded-lg text-sm <?= $tab === 'supplier' ? 'bg-primary text-white' : 'bg-slate-100' ?>">Supplier Report</a>
         <a href="?<?= htmlspecialchars($exportQuery, ENT_QUOTES, 'UTF-8') ?>" class="px-3 py-2 rounded-lg text-sm bg-info text-white no-underline inline-block">Export CSV</a>
     </div>
     <?php if ($tab === 'monthly'): ?>
@@ -784,7 +782,7 @@ ob_start();
 <?php if ($tab === 'customer' && $customerId > 0):
     $cylSql = '';
     if (table_exists($pdo, 'service_cylinder_rows')) {
-        $cylSql = ", COALESCE((SELECT GROUP_CONCAT(CONCAT(r.cylinder_size, ':', r.sent_qty, '/', r.received_qty, ' @ ', ROUND(r.sale_pressure, 2), ' Bar') SEPARATOR ' | ') FROM service_cylinder_rows r WHERE r.service_id = s.id), '') AS cylinder_summary";
+        $cylSql = ", COALESCE((SELECT GROUP_CONCAT(CONCAT(r.sent_qty, '/', r.received_qty, ' @ ', ROUND(r.sale_pressure, 2), ' Bar') SEPARATOR ' | ') FROM service_cylinder_rows r WHERE r.service_id = s.id), '') AS cylinder_summary";
     } else {
         $cylSql = ", '' AS cylinder_summary";
     }
@@ -930,11 +928,11 @@ ob_start();
     <div class="px-4 py-3 border-b border-slate-200 font-semibold">Supplier purchases</div>
     <div class="overflow-x-auto">
         <table class="w-full text-sm min-w-[1080px]">
-            <thead class="bg-slate-50"><tr><th class="text-left p-3">Date</th><th class="text-left p-3">Purchase</th><th class="text-left p-3">Type</th><th class="text-left p-3">Sent</th><th class="text-left p-3">Received</th><th class="text-left p-3">Total</th><th class="text-left p-3">Paid</th><th class="text-left p-3">Remaining</th><th class="text-left p-3">Status</th></tr></thead>
+            <thead class="bg-slate-50"><tr><th class="text-left p-3">Date</th><th class="text-left p-3">Purchase</th><th class="text-left p-3">Sent</th><th class="text-left p-3">Received</th><th class="text-left p-3">Total</th><th class="text-left p-3">Paid</th><th class="text-left p-3">Remaining</th><th class="text-left p-3">Status</th></tr></thead>
             <tbody>
-            <?php if (!$supplierPurchaseRows): ?><tr><td colspan="9" class="p-4 text-slate-500">No purchases for selected supplier.</td></tr><?php endif; ?>
+            <?php if (!$supplierPurchaseRows): ?><tr><td colspan="8" class="p-4 text-slate-500">No purchases for selected supplier.</td></tr><?php endif; ?>
             <?php foreach ($supplierPurchaseRows as $r): ?>
-                <tr class="border-t border-slate-100"><td class="p-3"><?= e(format_date_pk((string) $r['transaction_date'])) ?></td><td class="p-3">SP-<?= (int) $r['id'] ?></td><td class="p-3"><?= e((string) $r['cylinder_type']) ?></td><td class="p-3"><?= (int) $r['sent_quantity'] ?></td><td class="p-3"><?= (int) $r['total_received'] ?></td><td class="p-3"><?= e(format_currency((float) $r['total_amount'])) ?></td><td class="p-3"><?= e(format_currency((float) $r['paid_amount'])) ?></td><td class="p-3"><?= e(format_currency((float) $r['remaining_amount'])) ?></td><td class="p-3"><?= e((string) $r['payment_status']) ?></td></tr>
+                <tr class="border-t border-slate-100"><td class="p-3"><?= e(format_date_pk((string) $r['transaction_date'])) ?></td><td class="p-3">SP-<?= (int) $r['id'] ?></td><td class="p-3"><?= (int) $r['sent_quantity'] ?></td><td class="p-3"><?= (int) $r['total_received'] ?></td><td class="p-3"><?= e(format_currency((float) $r['total_amount'])) ?></td><td class="p-3"><?= e(format_currency((float) $r['paid_amount'])) ?></td><td class="p-3"><?= e(format_currency((float) $r['remaining_amount'])) ?></td><td class="p-3"><?= e((string) $r['payment_status']) ?></td></tr>
             <?php endforeach; ?>
             </tbody>
         </table>

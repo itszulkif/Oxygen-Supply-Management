@@ -1,0 +1,224 @@
+    <section class="app-card overflow-hidden" aria-labelledby="dash-tx-log">
+        <?php
+        $logDayMap = [];
+        foreach ($logDailySummary as $daySum) {
+            $logDayMap[(string) $daySum['group_key']] = $daySum;
+        }
+        $logHiddenFields = static function () use ($period, $logFrom, $logTo, $logType, $logDirection, $logQ, $logPerPage): void {
+            ?>
+            <input type="hidden" name="period" value="<?= e($period) ?>">
+            <input type="hidden" name="log_from" value="<?= e($logFrom) ?>">
+            <input type="hidden" name="log_to" value="<?= e($logTo) ?>">
+            <input type="hidden" name="log_direction" value="<?= e($logDirection) ?>">
+            <input type="hidden" name="log_per_page" value="<?= (int) $logPerPage ?>">
+            <?php if ($logType !== ''): ?><input type="hidden" name="log_type" value="<?= e($logType) ?>"><?php endif; ?>
+            <?php if ($logQ !== ''): ?><input type="hidden" name="log_q" value="<?= e($logQ) ?>"><?php endif; ?>
+            <?php if (i18n_locale() === 'ps'): ?><input type="hidden" name="lang" value="ps"><?php endif; ?>
+            <?php
+        };
+        $txDetailBaseUrl = $buildLogUrl(['ajax' => 'tx_detail', 'log_page' => null]);
+        ?>
+        <div class="px-4 sm:px-6 py-4 border-b border-slate-100">
+            <div class="flex flex-wrap items-start justify-between gap-3 mb-4">
+                <div>
+                    <h2 id="dash-tx-log" class="text-lg font-semibold text-slate-800"><?= e(__('dashboard.section_daily_log')) ?></h2>
+                    <p class="text-sm text-slate-500 mt-0.5"><?= e(__('dashboard.section_daily_log_hint')) ?></p>
+                </div>
+                <div class="flex flex-wrap gap-2">
+                    <a href="<?= e($buildLogUrl(['action' => 'export_cash_log_pdf', 'log_page' => null])) ?>" target="_blank" rel="noopener" class="btn btn-primary text-sm"><?= e(__('dashboard.btn_export_pdf')) ?></a>
+                    <a href="?module=orders<?= $langQ ?>" class="btn btn-soft text-sm"><?= e(__('nav.orders')) ?></a>
+                    <a href="?module=suppliers<?= $langQ ?>" class="btn btn-soft text-sm"><?= e(__('nav.suppliers')) ?></a>
+                </div>
+            </div>
+
+            <form method="get" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-6 gap-3 mb-4 p-3 rounded-xl bg-slate-50 border border-slate-100">
+                <input type="hidden" name="module" value="dashboard">
+                <input type="hidden" name="period" value="<?= e($period) ?>">
+                <?php if (i18n_locale() === 'ps'): ?><input type="hidden" name="lang" value="ps"><?php endif; ?>
+                <label class="block">
+                    <span class="text-xs font-medium text-slate-600"><?= e(__('dashboard.filter_from')) ?></span>
+                    <input type="date" name="log_from" value="<?= e($logFrom) ?>" class="app-input mt-1">
+                </label>
+                <label class="block">
+                    <span class="text-xs font-medium text-slate-600"><?= e(__('dashboard.filter_to')) ?></span>
+                    <input type="date" name="log_to" value="<?= e($logTo) ?>" class="app-input mt-1">
+                </label>
+                <label class="block">
+                    <span class="text-xs font-medium text-slate-600"><?= e(__('dashboard.filter_type')) ?></span>
+                    <select name="log_type" class="app-input mt-1">
+                        <option value=""><?= e(__('dashboard.filter_all_types')) ?></option>
+                        <option value="inflow_order" <?= $logType === 'inflow_order' ? 'selected' : '' ?>><?= e(__('dashboard.tx_type_order_payment')) ?></option>
+                        <option value="outflow_supplier" <?= $logType === 'outflow_supplier' ? 'selected' : '' ?>><?= e(__('dashboard.tx_type_supplier')) ?></option>
+                        <option value="outflow_expense" <?= $logType === 'outflow_expense' ? 'selected' : '' ?>><?= e(__('dashboard.tx_type_expense')) ?></option>
+                        <option value="outflow_salary" <?= $logType === 'outflow_salary' ? 'selected' : '' ?>><?= e(__('dashboard.tx_type_salary')) ?></option>
+                    </select>
+                </label>
+                <label class="block">
+                    <span class="text-xs font-medium text-slate-600"><?= e(__('dashboard.filter_direction')) ?></span>
+                    <select name="log_direction" class="app-input mt-1">
+                        <option value="all" <?= $logDirection === 'all' ? 'selected' : '' ?>><?= e(__('dashboard.filter_all_directions')) ?></option>
+                        <option value="in" <?= $logDirection === 'in' ? 'selected' : '' ?>><?= e(__('dashboard.filter_direction_in')) ?></option>
+                        <option value="out" <?= $logDirection === 'out' ? 'selected' : '' ?>><?= e(__('dashboard.filter_direction_out')) ?></option>
+                    </select>
+                </label>
+                <label class="block sm:col-span-2">
+                    <span class="text-xs font-medium text-slate-600"><?= e(__('dashboard.filter_search')) ?></span>
+                    <input type="search" name="log_q" value="<?= e($logQ) ?>" placeholder="<?= e(__('dashboard.filter_search_ph')) ?>" class="app-input mt-1">
+                </label>
+                <label class="block">
+                    <span class="text-xs font-medium text-slate-600"><?= e(__('dashboard.filter_per_page')) ?></span>
+                    <select name="log_per_page" class="app-input mt-1">
+                        <?php foreach ([10, 25, 50, 100] as $pp): ?>
+                            <option value="<?= $pp ?>" <?= $logPerPage === $pp ? 'selected' : '' ?>><?= $pp ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </label>
+                <div class="flex items-end gap-2 sm:col-span-2">
+                    <button type="submit" class="btn btn-primary flex-1"><?= e(__('dashboard.btn_apply_filters')) ?></button>
+                    <a href="<?= e($buildLogUrl(['log_from' => $fromDate, 'log_to' => $toDate, 'log_direction' => 'all', 'log_type' => null, 'log_q' => null, 'log_page' => null])) ?>" class="btn btn-soft"><?= e(__('dashboard.btn_reset_filters')) ?></a>
+                </div>
+            </form>
+
+            <?php if ($logDailySummary): ?>
+            <div class="flex gap-2 overflow-x-auto pb-2 mb-3">
+                <?php foreach (array_slice($logDailySummary, 0, 14) as $daySum): ?>
+                    <div class="shrink-0 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs min-w-[120px]">
+                        <p class="font-semibold text-slate-800"><?= e((string) $daySum['group_label']) ?></p>
+                        <p class="text-emerald-700 tabular-nums">+ <?= e(format_currency((float) $daySum['inflow'])) ?></p>
+                        <p class="text-rose-600 tabular-nums">- <?= e(format_currency((float) $daySum['outflow'])) ?></p>
+                    </div>
+                <?php endforeach; ?>
+            </div>
+            <?php endif; ?>
+
+            <p class="text-xs text-slate-500 mb-3">
+                <?= e(__('dashboard.log_results_summary', [
+                    'total' => (string) $logPagination['total'],
+                    'in' => format_currency($logFilteredIn),
+                    'out' => format_currency($logFilteredOut),
+                    'net' => format_currency($logFilteredIn - $logFilteredOut),
+                ])) ?>
+            </p>
+        </div>
+
+        <?php if (!$logPageItems): ?>
+            <p class="p-6 text-slate-500 text-sm"><?= e(__('dashboard.no_cash_movements')) ?></p>
+        <?php else: ?>
+            <div class="overflow-x-auto">
+                <table class="w-full text-sm min-w-[800px]">
+                    <thead class="bg-slate-50 border-t border-slate-100">
+                        <tr class="text-left text-slate-500 text-xs uppercase tracking-wide">
+                            <th class="p-3"><?= e(__('dashboard.col_date')) ?></th>
+                            <th class="p-3"><?= e(__('dashboard.col_type')) ?></th>
+                            <th class="p-3"><?= e(__('dashboard.col_description')) ?></th>
+                            <th class="p-3 text-end"><?= e(__('dashboard.col_in')) ?></th>
+                            <th class="p-3 text-end"><?= e(__('dashboard.col_out')) ?></th>
+                            <th class="p-3 text-end"><?= e(__('common.actions')) ?></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                    <?php
+                    $lastLogDayKey = null;
+                    foreach ($logPageItems as $tx):
+                        $dayKey = financial_bucket_key((string) $tx['date'], 'day');
+                        if ($dayKey !== $lastLogDayKey):
+                            $lastLogDayKey = $dayKey;
+                            $dayMeta = $logDayMap[$dayKey] ?? null;
+                            ?>
+                        <tr class="bg-slate-100/80 border-t border-slate-200">
+                            <td colspan="6" class="px-4 py-2">
+                                <div class="flex flex-wrap items-center justify-between gap-2 text-xs sm:text-sm">
+                                    <span class="font-semibold text-slate-800"><?= e($dayMeta ? (string) $dayMeta['group_label'] : format_date_pk((string) $tx['date'])) ?></span>
+                                    <?php if ($dayMeta): ?>
+                                    <span class="tabular-nums text-slate-600">
+                                        <span class="text-emerald-700">+ <?= e(format_currency((float) $dayMeta['inflow'])) ?></span>
+                                        <span class="mx-2 text-slate-300">|</span>
+                                        <span class="text-rose-600">- <?= e(format_currency((float) $dayMeta['outflow'])) ?></span>
+                                        <span class="mx-2 text-slate-300">|</span>
+                                        <span class="font-medium <?= (float) $dayMeta['net'] >= 0 ? 'text-sky-800' : 'text-rose-800' ?>"><?= e(__('dashboard.net')) ?>: <?= e(format_currency((float) $dayMeta['net'])) ?></span>
+                                    </span>
+                                    <?php endif; ?>
+                                </div>
+                            </td>
+                        </tr>
+                            <?php
+                        endif;
+                        ?>
+                        <tr class="border-t border-slate-50 hover:bg-slate-50/80">
+                            <td class="p-3 whitespace-nowrap text-slate-600"><?= e(format_date_pk((string) $tx['date'])) ?></td>
+                            <td class="p-3">
+                                <span class="inline-flex rounded-full px-2 py-0.5 text-xs font-medium <?= match ($tx['type']) {
+                                    'inflow_order' => 'bg-emerald-100 text-emerald-800',
+                                    'outflow_supplier' => 'bg-indigo-100 text-indigo-800',
+                                    'outflow_salary' => 'bg-amber-100 text-amber-900',
+                                    default => 'bg-slate-100 text-slate-700',
+                                } ?>"><?= e((string) $tx['type_label']) ?></span>
+                            </td>
+                            <td class="p-3 text-slate-800"><?= e((string) $tx['description']) ?></td>
+                            <td class="p-3 text-end tabular-nums text-emerald-700 font-medium"><?= (float) $tx['inflow'] > 0 ? e(format_currency((float) $tx['inflow'])) : '—' ?></td>
+                            <td class="p-3 text-end tabular-nums text-rose-600 font-medium"><?= (float) $tx['outflow'] > 0 ? e(format_currency((float) $tx['outflow'])) : '—' ?></td>
+                            <td class="p-3 text-end whitespace-nowrap">
+                                <button type="button" class="btn btn-soft text-xs py-1 px-2 tx-view-btn"
+                                    data-tx-type="<?= e((string) $tx['type']) ?>"
+                                    data-tx-id="<?= (int) $tx['ref_id'] ?>">
+                                    <?= e(__('dashboard.link_view')) ?>
+                                </button>
+                                <?php if ($tx['type'] === 'outflow_expense'): ?>
+                                    <form method="post" class="inline ms-1" onsubmit="return confirm('<?= e(__('dashboard.confirm_delete')) ?>');">
+                                        <input type="hidden" name="dashboard_action" value="delete_expense">
+                                        <input type="hidden" name="expense_id" value="<?= (int) $tx['ref_id'] ?>">
+                                        <?php $logHiddenFields(); ?>
+                                        <button type="submit" class="text-xs text-rose-600 hover:underline"><?= e(__('common.delete')) ?></button>
+                                    </form>
+                                <?php elseif ($tx['type'] === 'outflow_salary'): ?>
+                                    <form method="post" class="inline ms-1" onsubmit="return confirm('<?= e(__('dashboard.confirm_delete')) ?>');">
+                                        <input type="hidden" name="dashboard_action" value="delete_salary">
+                                        <input type="hidden" name="salary_id" value="<?= (int) $tx['ref_id'] ?>">
+                                        <?php $logHiddenFields(); ?>
+                                        <button type="submit" class="text-xs text-rose-600 hover:underline"><?= e(__('common.delete')) ?></button>
+                                    </form>
+                                <?php endif; ?>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+
+            <?php if ($logPagination['total_pages'] > 1): ?>
+            <nav class="px-4 sm:px-6 py-4 border-t border-slate-100 flex flex-wrap items-center justify-between gap-3" aria-label="<?= e(__('dashboard.pagination_label')) ?>">
+                <p class="text-sm text-slate-600">
+                    <?= e(__('dashboard.pagination_page', [
+                        'page' => (string) $logPagination['page'],
+                        'pages' => (string) $logPagination['total_pages'],
+                        'total' => (string) $logPagination['total'],
+                    ])) ?>
+                </p>
+                <div class="flex flex-wrap gap-2">
+                    <?php if ($logPagination['page'] > 1): ?>
+                        <a href="<?= e($buildLogUrl(['log_page' => (string) ($logPagination['page'] - 1)])) ?>" class="btn btn-soft text-sm"><?= e(__('dashboard.pagination_prev')) ?></a>
+                    <?php endif; ?>
+                    <?php if ($logPagination['page'] < $logPagination['total_pages']): ?>
+                        <a href="<?= e($buildLogUrl(['log_page' => (string) ($logPagination['page'] + 1)])) ?>" class="btn btn-soft text-sm"><?= e(__('dashboard.pagination_next')) ?></a>
+                    <?php endif; ?>
+                </div>
+            </nav>
+            <?php endif; ?>
+        <?php endif; ?>
+    </section>
+
+    <div id="txDetailModal" class="fixed inset-0 z-50 hidden" aria-hidden="true">
+        <div class="absolute inset-0 bg-slate-900/50" data-tx-modal-close></div>
+        <div class="absolute inset-0 flex items-center justify-center p-4 pointer-events-none">
+            <div class="bg-white rounded-2xl shadow-xl max-w-lg w-full max-h-[85vh] overflow-hidden pointer-events-auto" role="dialog" aria-modal="true" aria-labelledby="txDetailTitle">
+                <div class="px-5 py-4 border-b border-slate-100 flex items-center justify-between gap-3">
+                    <h3 id="txDetailTitle" class="text-lg font-semibold text-slate-900"><?= e(__('dashboard.detail_title')) ?></h3>
+                    <button type="button" class="text-slate-400 hover:text-slate-700 text-2xl leading-none" data-tx-modal-close aria-label="<?= e(__('common.close')) ?>">&times;</button>
+                </div>
+                <div id="txDetailBody" class="p-5 overflow-y-auto text-sm space-y-3 max-h-[60vh]"></div>
+                <div class="px-5 py-3 border-t border-slate-100 flex justify-end">
+                    <button type="button" class="btn btn-soft" data-tx-modal-close><?= e(__('common.close')) ?></button>
+                </div>
+            </div>
+        </div>
+    </div>

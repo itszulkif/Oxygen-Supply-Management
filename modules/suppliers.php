@@ -1,6 +1,7 @@
 <?php
 
 $pdo = db();
+ensure_supplier_transaction_notes_column($pdo);
 
 $pdo->exec("
     CREATE TABLE IF NOT EXISTS suppliers (
@@ -124,6 +125,7 @@ if (!column_exists($pdo, 'supplier_transactions', 'payment_type')) {
 if (!column_exists($pdo, 'supplier_transactions', 'payment_status')) {
     $pdo->exec("ALTER TABLE supplier_transactions ADD COLUMN payment_status ENUM('PAID','PARTIAL','DUE') NOT NULL DEFAULT 'DUE' AFTER payment_type");
 }
+ensure_supplier_transaction_notes_column($pdo);
 if (!column_exists($pdo, 'supplier_transactions', 'sent_quantity')) {
     $pdo->exec("ALTER TABLE supplier_transactions ADD COLUMN sent_quantity INT NOT NULL DEFAULT 0 AFTER supplier_id");
 }
@@ -191,6 +193,8 @@ if (!column_exists($pdo, 'supplier_ledger', 'reference_id')) {
 if (!column_exists($pdo, 'supplier_ledger', 'description')) {
     $pdo->exec("ALTER TABLE supplier_ledger ADD COLUMN description VARCHAR(255) NULL AFTER reference_id");
 }
+ensure_cylinder_daka_tash_columns($pdo);
+
 $ledgerDescMeta = $pdo->query("SHOW COLUMNS FROM supplier_ledger LIKE 'description'")->fetch();
 if ($ledgerDescMeta && stripos((string) ($ledgerDescMeta['Type'] ?? ''), 'varchar(255)') !== false) {
     try {
@@ -208,7 +212,7 @@ if ($cylindersTotalMeta && stripos((string) ($cylindersTotalMeta['Type'] ?? ''),
     $pdo->exec("ALTER TABLE cylinders MODIFY total DECIMAL(12,2) NOT NULL DEFAULT 0.00, MODIFY available DECIMAL(12,2) NOT NULL DEFAULT 0.00");
 }
 
-$seedTypes = ['Small', 'Medium', 'Large'];
+$seedTypes = [standard_cylinder_size()];
 $seedStmt = $pdo->prepare("INSERT IGNORE INTO cylinder_stock_by_type (cylinder_type, total, available) VALUES (?, 0, 0)");
 foreach ($seedTypes as $type) {
     $seedStmt->execute([$type]);
@@ -273,59 +277,27 @@ $sentByTypeFromTransactionRow = static function (array $row): array {
     ];
 };
 
-$formatPurchaseLedgerDescription = static function (PDO $pdo, int $purchaseId) use ($sentByTypeFromTransactionRow): string {
+$formatPurchaseLedgerDescription = static function (PDO $pdo, int $purchaseId, ?string $userNotes = null): string {
     $stmt = $pdo->prepare('SELECT * FROM supplier_transactions WHERE id = ? LIMIT 1');
     $stmt->execute([$purchaseId]);
     $t = $stmt->fetch();
     if (!$t) {
         return "Purchase #SP-{$purchaseId}";
     }
-    $sentBy = $sentByTypeFromTransactionRow($t);
-    $sentParts = [];
-    foreach (['Small', 'Medium', 'Large'] as $sz) {
-        $q = (int) ($sentBy[$sz] ?? 0);
-        if ($q <= 0) {
-            continue;
-        }
-        $pk = 'sent_pressure_' . strtolower($sz);
-        $pr = $t[$pk] ?? null;
-        $psi = ($pr !== null && $pr !== '' && (float) $pr > 0) ? (' @ ' . rtrim(rtrim((string) $pr, '0'), '.') . ' PSI') : '';
-        $sentParts[] = "{$sz} (Qty: {$q}{$psi})";
+    $notes = $userNotes !== null ? trim($userNotes) : trim((string) ($t['notes'] ?? ''));
+    if ($notes !== '') {
+        return mb_strlen($notes) > 1990 ? (mb_substr($notes, 0, 1987) . '…') : $notes;
     }
-    $recvStmt = $pdo->prepare('SELECT refill_cylinder_type, quantity, pressure_received, line_unit_price FROM supplier_refill_breakdown WHERE transaction_id = ? ORDER BY id ASC');
-    $recvStmt->execute([$purchaseId]);
-    $recvParts = [];
-    foreach ($recvStmt->fetchAll() as $r) {
-        $sz = (string) ($r['refill_cylinder_type'] ?? '');
-        if ($sz === '') {
-            $sz = (string) ($t['cylinder_type'] ?? 'Small');
-        }
-        $q = (int) ($r['quantity'] ?? 0);
-        if ($q <= 0) {
-            continue;
-        }
-        $pr = $r['pressure_received'] ?? null;
-        $psi = ($pr !== null && $pr !== '' && (float) $pr > 0) ? (' @ ' . rtrim(rtrim((string) $pr, '0'), '.') . ' PSI') : '';
-        $pu = (float) ($r['line_unit_price'] ?? 0);
-        $priceBit = $pu > 0 ? (' @ ' . format_currency($pu) . '/u') : '';
-        $recvParts[] = "{$sz} (Qty: {$q}{$psi}{$priceBit})";
-    }
-    $head = "Purchase #SP-{$purchaseId}";
-    $chunks = [];
-    if ($sentParts) {
-        $chunks[] = 'Sent: ' . implode(' | ', $sentParts);
-    }
-    if ($recvParts) {
-        $chunks[] = 'Received: ' . implode(' | ', $recvParts);
-    }
-    $avg = (float) ($t['unit_price'] ?? 0);
-    if ($avg > 0) {
-        $chunks[] = 'Avg unit: ' . format_currency($avg);
-    }
-    $out = $chunks ? ($head . ' — ' . implode(' — ', $chunks)) : $head;
+    $recvQty = supplier_transaction_received_qty($t);
+    $total = format_currency((float) ($t['total_amount'] ?? 0));
+    $paid = format_currency((float) ($t['paid_amount'] ?? 0));
+    $remaining = format_currency((float) ($t['remaining_amount'] ?? 0));
+    $payType = supplier_payment_type_label((string) ($t['payment_type'] ?? ''));
+    $out = "Purchase #SP-{$purchaseId} | Received: {$recvQty} | Bill: {$total} | Paid: {$paid} | Remaining: {$remaining} | {$payType}";
     if (strlen($out) > 1990) {
         $out = substr($out, 0, 1987) . '…';
     }
+
     return $out;
 };
 
@@ -334,25 +306,28 @@ $enrichSupplierHistoryPurchaseRow = static function (array $t) use ($sentByTypeF
     $sentBy = $sentByTypeFromTransactionRow($t);
     $sentChunks = [];
     $sentPsiOnly = [];
-    foreach (['Small', 'Medium', 'Large'] as $sz) {
-        $q = (int) ($sentBy[$sz] ?? 0);
-        if ($q <= 0) {
-            continue;
+    $totalSent = (int) ($sentBy['Small'] ?? 0) + (int) ($sentBy['Medium'] ?? 0) + (int) ($sentBy['Large'] ?? 0);
+    if ($totalSent > 0) {
+        $legacySp = $t['sent_pressure'] ?? null;
+        $psiNum = ($legacySp !== null && $legacySp !== '') ? (float) $legacySp : 0.0;
+        if ($psiNum <= 0) {
+            foreach (['small', 'medium', 'large'] as $pk) {
+                $pr = $t['sent_pressure_' . $pk] ?? null;
+                if ($pr !== null && $pr !== '' && (float) $pr > 0) {
+                    $psiNum = (float) $pr;
+                    break;
+                }
+            }
         }
-        $pk = 'sent_pressure_' . strtolower($sz);
-        $pr = $t[$pk] ?? null;
-        $psiNum = ($pr !== null && $pr !== '') ? (float) $pr : 0.0;
         $psiLabel = $psiNum > 0 ? (rtrim(rtrim((string) $psiNum, '0'), '.') . ' PSI') : '—';
-        $szLabel = cylinder_size_label($sz);
-        $sentChunks[] = $szLabel . ' (' . __('suppliers.break_qty') . ": {$q}, " . __('suppliers.break_pressure') . ": {$psiLabel})";
+        $sentChunks[] = __('suppliers.break_qty') . ": {$totalSent}, " . __('suppliers.break_pressure') . ": {$psiLabel}";
         if ($psiNum > 0) {
-            $sentPsiOnly[] = cylinder_size_label($sz) . ': ' . $psiLabel;
+            $sentPsiOnly[] = $psiLabel;
         }
     }
     $recvChunks = [];
     $recvPsiOnly = [];
     $raw = (string) ($t['breakdown_data'] ?? '');
-    $ctype = (string) ($t['cylinder_type'] ?? 'Small');
     if ($raw !== '') {
         foreach (explode('||', $raw) as $entry) {
             if ($entry === '') {
@@ -360,40 +335,41 @@ $enrichSupplierHistoryPurchaseRow = static function (array $t) use ($sentByTypeF
             }
             $p = explode('::', $entry);
             if (count($p) >= 6) {
-                $sz = trim((string) ($p[0] ?? '')) !== '' ? trim((string) $p[0]) : $ctype;
                 $qty = (int) ($p[2] ?? 0);
                 $psi = (float) ($p[3] ?? 0);
-                $unit = (float) ($p[4] ?? 0);
                 if ($qty <= 0) {
                     continue;
                 }
                 $psiLabel = $psi > 0 ? (rtrim(rtrim((string) $psi, '0'), '.') . ' PSI') : '—';
-                $szDisp = cylinder_size_label($sz);
-                $uBit = $unit > 0 ? (', ' . __('suppliers.break_unit') . ': ' . format_currency($unit)) : '';
-                $recvChunks[] = $szDisp . ' (' . __('suppliers.break_qty') . ": {$qty}, " . __('suppliers.break_pressure') . ": {$psiLabel}{$uBit})";
+                $recvChunks[] = __('suppliers.break_qty') . ": {$qty}, " . __('suppliers.break_pressure') . ": {$psiLabel}";
                 if ($psi > 0) {
-                    $recvPsiOnly[] = $szDisp . ': ' . rtrim(rtrim((string) $psi, '0'), '.') . ' PSI';
+                    $recvPsiOnly[] = rtrim(rtrim((string) $psi, '0'), '.') . ' PSI';
                 }
             } elseif (count($p) >= 3) {
                 $qty = (int) ($p[1] ?? 0);
                 if ($qty <= 0) {
                     continue;
                 }
-                $recvChunks[] = cylinder_size_label($ctype) . ' (' . __('suppliers.break_qty') . ": {$qty}, " . __('suppliers.break_pressure') . ': —)';
+                $recvChunks[] = __('suppliers.break_qty') . ": {$qty}, " . __('suppliers.break_pressure') . ': —';
             }
         }
     }
     $legacySp = $t['sent_pressure'] ?? null;
     $legacySentPsi = ($legacySp !== null && $legacySp !== '' && (float) $legacySp > 0)
         ? (rtrim(rtrim((string) (float) $legacySp, '0'), '.') . ' PSI') : '';
+    $notes = trim((string) ($t['notes'] ?? ''));
+
     return array_merge($t, [
+        'received_qty' => supplier_transaction_received_qty($t),
         'display_size_breakdown' => implode(' | ', array_filter([
             $sentChunks ? (__('suppliers.label_dispatch') . ': ' . implode(' | ', $sentChunks)) : '',
             $recvChunks ? (__('suppliers.label_receipt') . ': ' . implode(' | ', $recvChunks)) : '',
         ])),
         'display_sent_pressure' => $sentPsiOnly ? implode('; ', $sentPsiOnly) : ($legacySentPsi !== '' ? $legacySentPsi : '—'),
         'display_recv_pressure' => $recvPsiOnly ? implode('; ', $recvPsiOnly) : '—',
-        'display_unit_price' => __('currency.symbol') . ' ' . number_format((float) ($t['unit_price'] ?? 0), 2) . ' ' . __('suppliers.price_avg_suffix'),
+        'display_total_price' => format_currency((float) ($t['total_amount'] ?? 0)),
+        'display_notes' => $notes,
+        'display_payment_type' => supplier_payment_type_label((string) ($t['payment_type'] ?? '')),
     ]);
 };
 
@@ -454,7 +430,7 @@ $rebuildSupplierLedger = static function (PDO $pdo, int $supplierId) use ($forma
             'credit' => 0.0,
             'reference_type' => 'opening_balance',
             'reference_id' => (int) $supplierId,
-            'description' => 'Opening balance',
+            'description' => __('suppliers.ledger_opening_liability_desc'),
             'sort' => 0,
             'id' => (int) $supplierId,
         ];
@@ -482,6 +458,11 @@ $rebuildSupplierLedger = static function (PDO $pdo, int $supplierId) use ($forma
         $transactionId = (int) ($row['transaction_id'] ?? 0);
         $payType = (string) ($row['payment_type'] ?? 'Cash');
         $amtStr = format_currency((float) ($row['amount'] ?? 0));
+        if ($transactionId <= 0) {
+            $payDesc = __('suppliers.ledger_opening_payment_desc', ['amount' => $amtStr, 'type' => $payType]);
+        } else {
+            $payDesc = "Installment #SP-{$transactionId} ({$payType}) — {$amtStr} toward refill purchase";
+        }
         $events[] = [
             'date' => (string) ($row['payment_date'] ?? date('Y-m-d')),
             'type' => 'payment',
@@ -489,7 +470,7 @@ $rebuildSupplierLedger = static function (PDO $pdo, int $supplierId) use ($forma
             'credit' => (float) ($row['amount'] ?? 0),
             'reference_type' => 'payment',
             'reference_id' => $paymentId,
-            'description' => "Installment #SP-{$transactionId} ({$payType}) — {$amtStr} toward refill purchase",
+            'description' => $payDesc,
             'sort' => 2,
             'id' => $paymentId,
         ];
@@ -541,7 +522,7 @@ $loadPurchaseRows = static function (PDO $pdo, string $fromDate = '', string $to
         t.sent_pressure, t.sent_qty_small, t.sent_qty_medium, t.sent_qty_large,
         t.sent_pressure_small, t.sent_pressure_medium, t.sent_pressure_large,
         t.total_received, t.inventory_quantity, t.received_fully_quantity, t.unit_price, t.total_amount,
-        t.paid_amount, t.remaining_amount, t.payment_type, t.payment_status, t.transaction_date,
+        t.paid_amount, t.remaining_amount, t.payment_type, t.payment_status, t.notes, t.transaction_date,
         (SELECT GROUP_CONCAT(CONCAT(
             COALESCE(b.refill_cylinder_type, ''), '::', COALESCE(b.status_label, ''), '::', b.quantity, '::',
             COALESCE(b.pressure_received, 0), '::', COALESCE(b.line_unit_price, 0), '::', b.inventory_qty
@@ -608,16 +589,9 @@ $loadPendingBySupplier = static function (PDO $pdo): array {
             continue;
         }
         if (!isset($map[$sid])) {
-            $map[$sid] = ['Small' => 0, 'Medium' => 0, 'Large' => 0, 'total' => 0];
+            $map[$sid] = ['total' => 0];
         }
-        $t = (string) ($r['cylinder_type'] ?? 'Small');
-        if (!isset($map[$sid][$t])) {
-            continue;
-        }
-        $map[$sid][$t] = (int) ($r['pending_count'] ?? 0);
-    }
-    foreach ($map as $sid => $entry) {
-        $map[$sid]['total'] = (int) $entry['Small'] + (int) $entry['Medium'] + (int) $entry['Large'];
+        $map[$sid]['total'] += (int) ($r['pending_count'] ?? 0);
     }
     return $map;
 };
@@ -635,8 +609,16 @@ $buildPayload = static function (PDO $pdo, string $search = '', string $fromDate
     $supplierCount = (int) $pdo->query('SELECT COUNT(*) FROM suppliers')->fetchColumn();
     $totalPurchases = (float) $pdo->query('SELECT COALESCE(SUM(total_amount),0) FROM supplier_transactions')->fetchColumn();
     $totalPaid = (float) $pdo->query('SELECT COALESCE(SUM(amount),0) FROM supplier_payments')->fetchColumn();
-    $pendingPayments = max(0, $totalPurchases - $totalPaid);
+    $pendingPayments = supplier_global_pending_payments($pdo);
     $rows = $loadSuppliersTable($pdo, $search);
+    foreach ($rows as &$supplierRow) {
+        $supplierRow['outstanding'] = supplier_amount_owed(
+            (float) ($supplierRow['opening_balance'] ?? 0),
+            (float) ($supplierRow['purchases'] ?? 0),
+            (float) ($supplierRow['paid'] ?? 0)
+        );
+    }
+    unset($supplierRow);
     $supplierOptions = $pdo->query('SELECT id, name FROM suppliers ORDER BY name ASC')->fetchAll();
     $purchaseRows = $loadPurchaseRows($pdo, $fromDate, $toDate, $supplierFilter);
     $paymentHistory = $loadPaymentHistory($pdo, $paymentPeriod, $paymentSupplierFilter);
@@ -646,11 +628,13 @@ $buildPayload = static function (PDO $pdo, string $search = '', string $fromDate
         $periodPaid += (float) ($entry['paid_total'] ?? 0);
         $periodOutstanding += (float) ($entry['outstanding_balance'] ?? 0);
     }
-    $hasTotalPressure = column_exists($pdo, 'cylinder_stock_by_type', 'total_pressure');
-    $typedPressureExpr = $hasTotalPressure ? 'GREATEST(COALESCE(total_pressure, 0), COALESCE(available_pressure, 0))' : 'COALESCE(available_pressure, 0)';
-    $typedStock = $pdo->query("SELECT cylinder_type, total, available, {$typedPressureExpr} AS total_pressure, COALESCE(available_pressure, 0) AS available_pressure FROM cylinder_stock_by_type ORDER BY FIELD(cylinder_type,'Small','Medium','Large')")->fetchAll();
-    $stockTotals = $pdo->query('SELECT COALESCE(SUM(total),0) AS total, COALESCE(SUM(available),0) AS available FROM cylinders')->fetch() ?: ['total' => 0, 'available' => 0];
-    $stockPressureTotals = $pdo->query("SELECT COALESCE(SUM({$typedPressureExpr}),0) AS total_pressure, COALESCE(SUM(available_pressure),0) AS available_pressure FROM cylinder_stock_by_type")->fetch() ?: ['total_pressure' => 0, 'available_pressure' => 0];
+    $stdStockType = standard_cylinder_size();
+    $typeStock = cylinder_daka_tash_for_type($pdo, $stdStockType);
+    $typedStock = [[
+        'cylinder_type' => $stdStockType,
+        'available' => $typeStock['daka'],
+        'tash' => $typeStock['tash'],
+    ]];
     return [
         'summary' => [
             'suppliers' => $supplierCount,
@@ -671,10 +655,10 @@ $buildPayload = static function (PDO $pdo, string $search = '', string $fromDate
         ],
         'stockByType' => $typedStock,
         'stockTotals' => [
-            'total' => (float) $stockTotals['total'],
-            'available' => (float) $stockTotals['available'],
-            'total_pressure' => (float) ($stockPressureTotals['total_pressure'] ?? 0),
-            'available_pressure' => (float) ($stockPressureTotals['available_pressure'] ?? 0),
+            'daka' => (int) $typeStock['daka'],
+            'tash' => (int) $typeStock['tash'],
+            'total' => (int) $typeStock['daka'] + (int) $typeStock['tash'],
+            'available' => (int) $typeStock['daka'],
         ],
     ];
 };
@@ -690,9 +674,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET' && (($_GET['action'] ?? '') === 'export
     fputcsv($out, [
         __('suppliers.csv_id'),
         __('suppliers.csv_supplier'),
-        __('suppliers.csv_cylinder_type'),
         __('suppliers.csv_quantity'),
-        __('suppliers.csv_unit_price'),
         __('suppliers.csv_total'),
         __('suppliers.csv_paid'),
         __('suppliers.csv_remaining'),
@@ -709,9 +691,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET' && (($_GET['action'] ?? '') === 'export
         fputcsv($out, [
             (int) $r['id'],
             $r['supplier_name'],
-            cylinder_size_label((string) $r['cylinder_type']),
             (int) $r['quantity'],
-            number_format((float) $r['unit_price'], 2, '.', ''),
             number_format((float) $r['total_amount'], 2, '.', ''),
             number_format((float) $r['paid_amount'], 2, '.', ''),
             number_format((float) $r['remaining_amount'], 2, '.', ''),
@@ -750,11 +730,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET' && (($_GET['action'] ?? '') === 'print_
     <h3><?= e((string) $row['supplier_name']) ?></h3>
     <p><?= e(__('suppliers.print_contact')) ?>: <?= e((string) ($row['contact_person'] ?? '-')) ?> | <?= e(__('suppliers.print_phone')) ?>: <?= e((string) ($row['phone'] ?? '-')) ?></p>
     <table>
-        <tr><th><?= e(__('suppliers.print_col_type')) ?></th><th><?= e(__('suppliers.print_col_qty')) ?></th><th><?= e(__('suppliers.print_col_unit_price')) ?></th><th><?= e(__('suppliers.print_col_total')) ?></th><th><?= e(__('suppliers.print_col_paid')) ?></th><th><?= e(__('suppliers.print_col_remaining')) ?></th><th><?= e(__('suppliers.print_col_status')) ?></th></tr>
+        <tr><th><?= e(__('suppliers.print_col_qty')) ?></th><th><?= e(__('suppliers.print_col_total_price')) ?></th><th><?= e(__('suppliers.print_col_paid')) ?></th><th><?= e(__('suppliers.print_col_remaining')) ?></th><th><?= e(__('suppliers.print_col_status')) ?></th></tr>
         <tr>
-            <td><?= e(cylinder_size_label((string) $row['cylinder_type'])) ?></td>
             <td><?= (int) $row['quantity'] ?></td>
-            <td><?= e(format_currency((float) $row['unit_price'])) ?></td>
             <td><?= e(format_currency((float) $row['total_amount'])) ?></td>
             <td><?= e(format_currency((float) $row['paid_amount'])) ?></td>
             <td><?= e(format_currency((float) $row['remaining_amount'])) ?></td>
@@ -767,7 +745,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET' && (($_GET['action'] ?? '') === 'print_
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $action = request_value('action');
+    $action = trim(request_value('purchase_action', request_value('action', '')));
     try {
         if ($action === 'fetch_dashboard') {
             $search = request_value('search');
@@ -803,6 +781,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ]);
         }
 
+        if ($action === 'adjust_cylinder_stock') {
+            $cylinderType = normalize_cylinder_type(standard_cylinder_size());
+            $stockMode = request_value('stock_mode', 'add');
+            if (!in_array($stockMode, ['add', 'set'], true)) {
+                $stockMode = 'add';
+            }
+            $dakaQty = max(0, (int) request_value('daka_qty', '0'));
+            $tashQty = max(0, (int) request_value('tash_qty', '0'));
+            if ($dakaQty <= 0 && $tashQty <= 0) {
+                $jsonResponse(false, __('suppliers.err_stock_qty_required'));
+            }
+            ensure_cylinder_daka_tash_columns($pdo);
+            if ($stockMode === 'set') {
+                set_cylinder_daka_tash_stock($pdo, $cylinderType, $dakaQty, $tashQty);
+            } else {
+                adjust_cylinder_daka_tash($pdo, $cylinderType, $dakaQty, $tashQty);
+            }
+            $jsonResponse(true, __('suppliers.msg_stock_updated'), ['data' => $buildPayload($pdo)]);
+        }
+
         if ($action === 'add_supplier') {
             $name = request_value('name');
             $contactPerson = request_value('contact_person');
@@ -817,79 +815,56 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $stmt = $pdo->prepare('INSERT INTO suppliers (name, contact_person, phone, email, address, opening_balance) VALUES (?, ?, ?, ?, ?, ?)');
             $stmt->execute([$name, $contactPerson, $phone, $email !== '' ? $email : null, $address, $openingBalance]);
             $supplierId = (int) $pdo->lastInsertId();
-            if ($openingBalance > 0) {
-                $ledgerStmt = $pdo->prepare("INSERT INTO supplier_ledger (supplier_id, debit, credit, balance, reference_type, reference_id, description, entry_date) VALUES (?, ?, 0, ?, 'opening_balance', ?, ?, ?)");
-                $ledgerStmt->execute([$supplierId, $openingBalance, $openingBalance, $supplierId, __('suppliers.ledger_opening_desc'), date('Y-m-d')]);
-            }
             $pdo->commit();
+            if ($openingBalance > 0) {
+                $rebuildSupplierLedger($pdo, $supplierId);
+            }
             $jsonResponse(true, __('suppliers.msg_supplier_added'), ['data' => $buildPayload($pdo)]);
         }
 
         if ($action === 'record_purchase' || $action === 'update_purchase') {
             $purchaseId = (int) request_value('purchase_id', '0');
             $supplierId = (int) request_value('supplier_id', '0');
-            $cylinderType = request_value('cylinder_type', 'Small');
-            $sentByType = [
-                'Small' => max(0, (int) request_value('sent_qty_Small', '0')),
-                'Medium' => max(0, (int) request_value('sent_qty_Medium', '0')),
-                'Large' => max(0, (int) request_value('sent_qty_Large', '0')),
-            ];
-            $sentPressureByType = [];
-            foreach (['Small', 'Medium', 'Large'] as $sz) {
-                $raw = request_value('sent_pressure_' . $sz, '');
-                $sentPressureByType[$sz] = $raw === '' ? null : max(0, (float) $raw);
+            $stdSize = standard_cylinder_size();
+            $cylinderType = $stdSize;
+            $sentQty = max(0, (int) request_value('sent_qty', '0'));
+            if ($sentQty <= 0) {
+                $sentQty = max(0, (int) request_value('sent_qty_' . $stdSize, '0'));
             }
-            $sentQuantity = $sentByType['Small'] + $sentByType['Medium'] + $sentByType['Large'];
-            $nonZeroSizes = array_values(array_filter(['Small', 'Medium', 'Large'], static function (string $t) use ($sentByType): bool {
-                return ($sentByType[$t] ?? 0) > 0;
-            }));
-            if (count($nonZeroSizes) === 1) {
-                $cylinderType = $nonZeroSizes[0];
-            } elseif (count($nonZeroSizes) > 1) {
-                $cylinderType = 'Mixed';
-            } else {
-                $cylinderType = in_array($cylinderType, ['Small', 'Medium', 'Large', 'Mixed'], true) ? $cylinderType : 'Small';
-            }
+            $sentByType = ['Small' => 0, 'Medium' => 0, 'Large' => 0];
+            $sentByType[$stdSize] = $sentQty;
+            $sentPressureByType = ['Small' => null, 'Medium' => null, 'Large' => null];
+            $sentQuantity = $sentQty;
             $sentPressureVal = null;
-            foreach (['Small', 'Medium', 'Large'] as $sz) {
-                if (($sentPressureByType[$sz] ?? null) !== null) {
-                    $sentPressureVal = $sentPressureByType[$sz];
-                    break;
-                }
-            }
             $dateSent = request_value('date_sent', date('Y-m-d'));
-            $defaultUnitPrice = max(0, (float) request_value('unit_price', '0'));
             $transactionDate = request_value('transaction_date', date('Y-m-d'));
             $paidAmount = max(0, (float) request_value('paid_amount', '0'));
             $paymentType = request_value('payment_type', 'Credit');
-            $validTypes = ['Small', 'Medium', 'Large', 'Mixed'];
+            $transactionNotes = trim(request_value('transaction_notes', ''));
             $validPaymentTypes = ['Cash', 'Bank', 'Credit'];
             $recvByType = ['Small' => 0, 'Medium' => 0, 'Large' => 0];
             $breakdownRows = [];
             $inventoryQuantity = 0.0;
             $receivedPressureTotal = 0.0;
             $totalAmount = 0.0;
-            foreach ($validTypes as $sz) {
-                $qty = max(0, (int) request_value('recv_qty_' . $sz, '0'));
-                $pressureRaw = request_value('recv_pressure_' . $sz, '');
-                $pressureVal = $pressureRaw === '' ? null : max(0, (float) $pressureRaw);
-                $lineUnit = max(0, (float) request_value('recv_unit_price_' . $sz, '0'));
-                if ($lineUnit <= 0) {
-                    $lineUnit = $defaultUnitPrice;
-                }
-                if ($qty <= 0) {
-                    continue;
-                }
-                $recvByType[$sz] = $qty;
-                $invQty = (float) $qty;
-                $inventoryQuantity += $invQty;
-                $receivedPressureTotal += $invQty * (float) ($pressureVal ?? 0.0);
-                $lineTotal = $invQty * $lineUnit;
-                $totalAmount += $lineTotal;
+            $recvQty = max(0, (int) request_value('recv_qty', '0'));
+            if ($recvQty <= 0) {
+                $recvQty = max(0, (int) request_value('recv_qty_' . $stdSize, '0'));
+            }
+            $recvTotalPrice = max(0, (float) request_value('recv_total_price', '0'));
+            if ($recvTotalPrice <= 0) {
+                $recvTotalPrice = max(0, (float) request_value('recv_total_price_' . $stdSize, '0'));
+            }
+            if ($recvQty > 0) {
+                $recvByType[$stdSize] = $recvQty;
+                $invQty = (float) $recvQty;
+                $inventoryQuantity = $invQty;
+                $totalAmount = $recvTotalPrice;
+                $lineUnit = $recvQty > 0 ? ($recvTotalPrice / $recvQty) : 0.0;
                 $breakdownRows[] = [
-                    'size' => $sz,
-                    'qty' => $qty,
-                    'pressure' => $pressureVal,
+                    'size' => $stdSize,
+                    'qty' => $recvQty,
+                    'pressure' => null,
                     'line_unit' => $lineUnit,
                     'inventory_qty' => $invQty,
                 ];
@@ -897,23 +872,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if (!$breakdownRows) {
                 $jsonResponse(false, __('suppliers.err_recv_qty_required'));
             }
-            if (!in_array($cylinderType, $validTypes, true) || !in_array($paymentType, $validPaymentTypes, true)) {
+            if (!in_array($paymentType, $validPaymentTypes, true)) {
                 $jsonResponse(false, __('suppliers.err_invalid_types'));
             }
             if ($supplierId <= 0) {
                 $jsonResponse(false, __('suppliers.err_select_supplier'));
             }
-            if ($totalAmount <= 0 && $defaultUnitPrice <= 0) {
-                $jsonResponse(false, __('suppliers.err_unit_price_required'));
+            if ($recvQty > 0 && $recvTotalPrice <= 0) {
+                $jsonResponse(false, __('suppliers.err_total_price_required'));
             }
             if ($totalAmount <= 0) {
-                $totalAmount = $inventoryQuantity * $defaultUnitPrice;
+                $jsonResponse(false, __('suppliers.err_total_price_required'));
             }
             $computedReceived = (int) round($inventoryQuantity);
             $totalReceived = $computedReceived;
             $quantity = $totalReceived;
             $receivedFully = $totalReceived;
-            $avgUnitPrice = $inventoryQuantity > 0 ? ($totalAmount / $inventoryQuantity) : $defaultUnitPrice;
+            $avgUnitPrice = $inventoryQuantity > 0 ? ($totalAmount / $inventoryQuantity) : 0.0;
             $unitPrice = $avgUnitPrice;
             $paidAmount = min($paidAmount, $totalAmount);
             $remainingAmount = max(0, $totalAmount - $paidAmount);
@@ -950,47 +925,36 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $oldSentByType = $sentByTypeFromTransactionRow($old);
                 $oldRecvByType = $loadReceivedByType($pdo, $purchaseId);
                 $adjustSupplierPending($pdo, $oldSupplierId, $oldSentByType, $oldRecvByType, -1);
-
-                $invByOld = $loadBreakdownInventoryByType($pdo, $purchaseId);
-                $pressureByOld = $loadBreakdownPressureByType($pdo, $purchaseId);
-                foreach ($invByOld as $ctype => $deltaQty) {
-                    $deltaPressure = (float) ($pressureByOld[$ctype] ?? 0.0);
-                    if ($deltaQty == 0.0 && $deltaPressure == 0.0) {
-                        continue;
-                    }
-                    $neg = -1 * $deltaQty;
-                    $negPressure = -1 * $deltaPressure;
-                    if (column_exists($pdo, 'cylinder_stock_by_type', 'total_pressure')) {
-                        $pdo->prepare("UPDATE cylinder_stock_by_type SET total = GREATEST(0, total + ?), available = GREATEST(0, available + ?), available_pressure = GREATEST(0, available_pressure + ?), total_pressure = GREATEST(0, total_pressure + ?) WHERE cylinder_type = ?")
-                            ->execute([$neg, $neg, $negPressure, $negPressure, $ctype]);
-                    } else {
-                        $pdo->prepare("UPDATE cylinder_stock_by_type SET total = GREATEST(0, total + ?), available = GREATEST(0, available + ?), available_pressure = GREATEST(0, available_pressure + ?) WHERE cylinder_type = ?")
-                            ->execute([$neg, $neg, $negPressure, $ctype]);
+                foreach ($oldSentByType as $ctype => $q) {
+                    if ($q > 0) {
+                        adjust_cylinder_daka_tash($pdo, $ctype, 0, $q);
                     }
                 }
-                $sumOldInv = array_sum($invByOld);
-                $pdo->prepare("UPDATE cylinders SET total = GREATEST(0, total + ?), available = GREATEST(0, available + ?) ORDER BY id ASC LIMIT 1")
-                    ->execute([-1 * $sumOldInv, -1 * $sumOldInv]);
+                foreach ($oldRecvByType as $ctype => $q) {
+                    if ($q > 0) {
+                        adjust_cylinder_daka_tash($pdo, $ctype, -$q, 0);
+                    }
+                }
 
                 $pdo->prepare("DELETE FROM supplier_payments WHERE transaction_id = ?")->execute([$purchaseId]);
                 $pdo->prepare("DELETE FROM supplier_ledger WHERE reference_type = 'purchase' AND reference_id = ?")->execute([$purchaseId]);
                 $pdo->prepare("DELETE FROM supplier_ledger WHERE reference_type = 'payment' AND reference_id = ?")->execute([$purchaseId]);
                 $pdo->prepare("DELETE FROM supplier_refill_breakdown WHERE transaction_id = ?")->execute([$purchaseId]);
                 $pdo->prepare("DELETE FROM refill_discrepancy WHERE transaction_id = ?")->execute([$purchaseId]);
-                $txUpdate = $pdo->prepare("UPDATE supplier_transactions SET supplier_id=?, cylinder_type=?, sent_quantity=?, sent_pressure=?, sent_qty_small=?, sent_qty_medium=?, sent_qty_large=?, sent_pressure_small=?, sent_pressure_medium=?, sent_pressure_large=?, date_sent=?, quantity=?, total_received=?, inventory_quantity=?, received_fully_quantity=?, received_pressure_total=?, unit_price=?, total_amount=?, paid_amount=?, remaining_amount=?, payment_type=?, payment_status=?, transaction_date=? WHERE id=?");
+                $txUpdate = $pdo->prepare("UPDATE supplier_transactions SET supplier_id=?, cylinder_type=?, sent_quantity=?, sent_pressure=?, sent_qty_small=?, sent_qty_medium=?, sent_qty_large=?, sent_pressure_small=?, sent_pressure_medium=?, sent_pressure_large=?, date_sent=?, quantity=?, total_received=?, inventory_quantity=?, received_fully_quantity=?, received_pressure_total=?, unit_price=?, total_amount=?, paid_amount=?, remaining_amount=?, payment_type=?, payment_status=?, notes=?, transaction_date=? WHERE id=?");
                 $txUpdate->execute([
                     $supplierId, $cylinderType, $sentQuantity, $sentPressureVal,
                     $sentByType['Small'], $sentByType['Medium'], $sentByType['Large'],
                     $sentPressureByType['Small'], $sentPressureByType['Medium'], $sentPressureByType['Large'],
-                    $dateSent, $quantity, $totalReceived, $inventoryQuantity, $receivedFully, $receivedPressureTotal, $unitPrice, $totalAmount, $paidAmount, $remainingAmount, $paymentType, $status, $transactionDate, $purchaseId,
+                    $dateSent, $quantity, $totalReceived, $inventoryQuantity, $receivedFully, $receivedPressureTotal, $unitPrice, $totalAmount, $paidAmount, $remainingAmount, $paymentType, $status, $transactionNotes !== '' ? $transactionNotes : null, $transactionDate, $purchaseId,
                 ]);
             } else {
-                $txInsert = $pdo->prepare("INSERT INTO supplier_transactions (supplier_id, cylinder_type, sent_quantity, sent_pressure, sent_qty_small, sent_qty_medium, sent_qty_large, sent_pressure_small, sent_pressure_medium, sent_pressure_large, date_sent, quantity, total_received, inventory_quantity, received_fully_quantity, received_pressure_total, unit_price, total_amount, paid_amount, remaining_amount, payment_type, payment_status, transaction_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+                $txInsert = $pdo->prepare("INSERT INTO supplier_transactions (supplier_id, cylinder_type, sent_quantity, sent_pressure, sent_qty_small, sent_qty_medium, sent_qty_large, sent_pressure_small, sent_pressure_medium, sent_pressure_large, date_sent, quantity, total_received, inventory_quantity, received_fully_quantity, received_pressure_total, unit_price, total_amount, paid_amount, remaining_amount, payment_type, payment_status, notes, transaction_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
                 $txInsert->execute([
                     $supplierId, $cylinderType, $sentQuantity, $sentPressureVal,
                     $sentByType['Small'], $sentByType['Medium'], $sentByType['Large'],
                     $sentPressureByType['Small'], $sentPressureByType['Medium'], $sentPressureByType['Large'],
-                    $dateSent, $quantity, $totalReceived, $inventoryQuantity, $receivedFully, $receivedPressureTotal, $unitPrice, $totalAmount, $paidAmount, $remainingAmount, $paymentType, $status, $transactionDate,
+                    $dateSent, $quantity, $totalReceived, $inventoryQuantity, $receivedFully, $receivedPressureTotal, $unitPrice, $totalAmount, $paidAmount, $remainingAmount, $paymentType, $status, $transactionNotes !== '' ? $transactionNotes : null, $transactionDate,
                 ]);
                 $purchaseId = (int) $pdo->lastInsertId();
             }
@@ -1028,23 +992,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $ledgerCredit->execute([$supplierId, $paidAmount, $afterCreditBalance, $purchaseId, $payDesc, $transactionDate]);
             }
 
-            foreach ($breakdownRows as $rowItem) {
-                $add = $rowItem['inventory_qty'];
-                $addPressure = (float) $add * (float) ($rowItem['pressure'] ?? 0.0);
-                if (column_exists($pdo, 'cylinder_stock_by_type', 'total_pressure')) {
-                    $pdo->prepare("UPDATE cylinder_stock_by_type SET total = total + ?, available = available + ?, available_pressure = available_pressure + ?, total_pressure = total_pressure + ? WHERE cylinder_type = ?")
-                        ->execute([$add, $add, $addPressure, $addPressure, $rowItem['size']]);
-                } else {
-                    $pdo->prepare("UPDATE cylinder_stock_by_type SET total = total + ?, available = available + ?, available_pressure = available_pressure + ? WHERE cylinder_type = ?")
-                        ->execute([$add, $add, $addPressure, $rowItem['size']]);
+            if ($sentQty > 0 && cylinder_tash_available($pdo, $stdSize) < $sentQty) {
+                $pdo->rollBack();
+                $jsonResponse(false, str_replace('{qty}', (string) $sentQty, __('suppliers.err_insufficient_tash')));
+            }
+            foreach ($sentByType as $ctype => $q) {
+                if ($q > 0) {
+                    adjust_cylinder_daka_tash($pdo, $ctype, 0, -$q);
                 }
             }
-            $addTotal = $inventoryQuantity;
-            $stockRow = $pdo->query('SELECT id, total, available FROM cylinders ORDER BY id ASC LIMIT 1 FOR UPDATE')->fetch();
-            if (!$stockRow) {
-                $pdo->prepare("INSERT INTO cylinders (total, available, issued, empty) VALUES (?, ?, 0, 0)")->execute([$addTotal, $addTotal]);
-            } else {
-                $pdo->prepare("UPDATE cylinders SET total = total + ?, available = available + ? WHERE id = ?")->execute([$addTotal, $addTotal, (int) $stockRow['id']]);
+            foreach ($breakdownRows as $rowItem) {
+                $addDaka = (int) round((float) $rowItem['inventory_qty']);
+                if ($addDaka > 0) {
+                    adjust_cylinder_daka_tash($pdo, (string) $rowItem['size'], $addDaka, 0);
+                }
             }
 
             $pdo->commit();
@@ -1084,26 +1045,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             };
             $oldRecvByType = $loadReceivedByTypeDel($pdo, $purchaseId);
             $adjustSupplierPending($pdo, $supplierIdDel, $oldSentByTypeDel, $oldRecvByType, -1);
-            $invByType = $loadBreakdownInventoryByType($pdo, $purchaseId);
-            $pressureByType = $loadBreakdownPressureByType($pdo, $purchaseId);
-            foreach ($invByType as $ctype => $deltaQty) {
-                $deltaPressure = (float) ($pressureByType[$ctype] ?? 0.0);
-                if ($deltaQty == 0.0 && $deltaPressure == 0.0) {
-                    continue;
-                }
-                $neg = -1 * $deltaQty;
-                $negPressure = -1 * $deltaPressure;
-                if (column_exists($pdo, 'cylinder_stock_by_type', 'total_pressure')) {
-                    $pdo->prepare("UPDATE cylinder_stock_by_type SET total = GREATEST(0, total + ?), available = GREATEST(0, available + ?), available_pressure = GREATEST(0, available_pressure + ?), total_pressure = GREATEST(0, total_pressure + ?) WHERE cylinder_type = ?")
-                        ->execute([$neg, $neg, $negPressure, $negPressure, $ctype]);
-                } else {
-                    $pdo->prepare("UPDATE cylinder_stock_by_type SET total = GREATEST(0, total + ?), available = GREATEST(0, available + ?), available_pressure = GREATEST(0, available_pressure + ?) WHERE cylinder_type = ?")
-                        ->execute([$neg, $neg, $negPressure, $ctype]);
+            foreach ($oldSentByTypeDel as $ctype => $q) {
+                if ($q > 0) {
+                    adjust_cylinder_daka_tash($pdo, $ctype, 0, $q);
                 }
             }
-            $sumInv = array_sum($invByType);
-            $pdo->prepare("UPDATE cylinders SET total = GREATEST(0, total + ?), available = GREATEST(0, available + ?) ORDER BY id ASC LIMIT 1")
-                ->execute([-1 * $sumInv, -1 * $sumInv]);
+            foreach ($oldRecvByType as $ctype => $q) {
+                if ($q > 0) {
+                    adjust_cylinder_daka_tash($pdo, $ctype, -$q, 0);
+                }
+            }
             $pdo->prepare("DELETE FROM supplier_payments WHERE transaction_id = ?")->execute([$purchaseId]);
             $pdo->prepare("DELETE FROM supplier_ledger WHERE reference_id = ? AND reference_type IN ('purchase','payment')")->execute([$purchaseId]);
             $pdo->prepare("DELETE FROM supplier_refill_breakdown WHERE transaction_id = ?")->execute([$purchaseId]);
@@ -1126,7 +1077,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $supplierId = (int) request_value('supplier_id', '0');
             $historyStmt = $pdo->prepare("SELECT t.id, t.cylinder_type, t.sent_quantity, t.sent_pressure, t.sent_qty_small, t.sent_qty_medium, t.sent_qty_large,
                 t.sent_pressure_small, t.sent_pressure_medium, t.sent_pressure_large,
-                t.quantity, t.total_received, t.inventory_quantity, t.unit_price, t.total_amount, t.paid_amount, t.remaining_amount, t.payment_status, t.transaction_date,
+                t.quantity, t.total_received, t.inventory_quantity, t.unit_price, t.total_amount, t.paid_amount, t.remaining_amount, t.payment_type, t.payment_status, t.notes, t.transaction_date,
                 (SELECT GROUP_CONCAT(CONCAT(
                     COALESCE(b.refill_cylinder_type, ''), '::', COALESCE(b.status_label, ''), '::', b.quantity, '::',
                     COALESCE(b.pressure_received, 0), '::', COALESCE(b.line_unit_price, 0), '::', b.inventory_qty
@@ -1142,16 +1093,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $payments = $paymentStmt->fetchAll();
             $ledgerStmt = $pdo->prepare("SELECT entry_date, debit, credit, balance, reference_type, reference_id, description FROM supplier_ledger WHERE supplier_id = ? ORDER BY id DESC");
             $ledgerStmt->execute([$supplierId]);
-            $pendingBakee = ['Small' => 0, 'Medium' => 0, 'Large' => 0, 'total' => 0];
-            $pendingStmt = $pdo->prepare("SELECT cylinder_type, pending_count FROM supplier_pending_cylinders WHERE supplier_id = ?");
+            $pendingBakee = ['total' => 0];
+            $pendingStmt = $pdo->prepare('SELECT COALESCE(SUM(pending_count), 0) FROM supplier_pending_cylinders WHERE supplier_id = ?');
             $pendingStmt->execute([$supplierId]);
-            foreach ($pendingStmt->fetchAll() as $pr) {
-                $ct = (string) ($pr['cylinder_type'] ?? '');
-                if (isset($pendingBakee[$ct])) {
-                    $pendingBakee[$ct] = (int) ($pr['pending_count'] ?? 0);
-                }
-            }
-            $pendingBakee['total'] = $pendingBakee['Small'] + $pendingBakee['Medium'] + $pendingBakee['Large'];
+            $pendingBakee['total'] = (int) $pendingStmt->fetchColumn();
             $jsonResponse(true, __('suppliers.ajax_history_loaded'), [
                 'history' => $historyRows,
                 'ledger' => $ledgerStmt->fetchAll(),
@@ -1164,41 +1109,56 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $paymentId = (int) request_value('payment_id', '0');
             $supplierId = (int) request_value('supplier_id', '0');
             $transactionId = (int) request_value('transaction_id', '0');
+            $paymentTarget = trim((string) request_value('payment_target', ''));
             $paymentDate = request_value('payment_date', date('Y-m-d'));
             $paymentType = request_value('payment_type', 'Cash');
             $amount = max(0, (float) request_value('amount', '0'));
             $validPaymentTypes = ['Cash', 'Bank', 'Credit'];
-            if ($supplierId <= 0 || $transactionId <= 0 || $amount <= 0) {
+            if ($supplierId <= 0 || $amount <= 0) {
                 $jsonResponse(false, __('suppliers.err_supplier_purchase_amount'));
             }
             if (!in_array($paymentType, $validPaymentTypes, true)) {
                 $jsonResponse(false, __('suppliers.err_invalid_payment_type'));
             }
-            $txStmt = $pdo->prepare("SELECT id, total_amount FROM supplier_transactions WHERE id = ? AND supplier_id = ? LIMIT 1");
-            $txStmt->execute([$transactionId, $supplierId]);
-            $tx = $txStmt->fetch();
-            if (!$tx) {
-                $jsonResponse(false, __('suppliers.err_purchase_record_not_found'));
+            $payOpening = $paymentTarget === 'opening' || $transactionId <= 0;
+            if ($payOpening) {
+                $openingRemaining = supplier_opening_balance_remaining($pdo, $supplierId);
+                if ($openingRemaining <= 0.00001) {
+                    $jsonResponse(false, __('suppliers.err_no_opening_due'));
+                }
+                if ($amount > $openingRemaining + 0.00001) {
+                    $jsonResponse(false, __('suppliers.err_payment_exceeds_opening'));
+                }
+                $transactionId = 0;
+            } else {
+                $txStmt = $pdo->prepare("SELECT id, total_amount FROM supplier_transactions WHERE id = ? AND supplier_id = ? LIMIT 1");
+                $txStmt->execute([$transactionId, $supplierId]);
+                $tx = $txStmt->fetch();
+                if (!$tx) {
+                    $jsonResponse(false, __('suppliers.err_purchase_record_not_found'));
+                }
             }
             $pdo->beginTransaction();
             if ($paymentId > 0) {
                 $updateStmt = $pdo->prepare("UPDATE supplier_payments SET transaction_id = ?, amount = ?, payment_type = ?, payment_date = ? WHERE id = ? AND supplier_id = ?");
-                $updateStmt->execute([$transactionId, $amount, $paymentType, $paymentDate, $paymentId, $supplierId]);
+                $updateStmt->execute([$payOpening ? null : $transactionId, $amount, $paymentType, $paymentDate, $paymentId, $supplierId]);
             } else {
                 $insertStmt = $pdo->prepare("INSERT INTO supplier_payments (supplier_id, transaction_id, amount, payment_type, payment_date) VALUES (?, ?, ?, ?, ?)");
-                $insertStmt->execute([$supplierId, $transactionId, $amount, $paymentType, $paymentDate]);
+                $insertStmt->execute([$supplierId, $payOpening ? null : $transactionId, $amount, $paymentType, $paymentDate]);
             }
-            $sumStmt = $pdo->prepare("SELECT COALESCE(SUM(amount),0) AS paid_total FROM supplier_payments WHERE transaction_id = ?");
-            $sumStmt->execute([$transactionId]);
-            $paidTotal = (float) (($sumStmt->fetch()['paid_total'] ?? 0));
-            $total = (float) ($tx['total_amount'] ?? 0);
-            $remaining = max(0, $total - $paidTotal);
-            $status = $paymentStatus($total, $paidTotal);
-            $updateTxStmt = $pdo->prepare("UPDATE supplier_transactions SET paid_amount = ?, remaining_amount = ?, payment_status = ? WHERE id = ?");
-            $updateTxStmt->execute([$paidTotal, $remaining, $status, $transactionId]);
+            if (!$payOpening) {
+                $sumStmt = $pdo->prepare("SELECT COALESCE(SUM(amount),0) AS paid_total FROM supplier_payments WHERE transaction_id = ?");
+                $sumStmt->execute([$transactionId]);
+                $paidTotal = (float) (($sumStmt->fetch()['paid_total'] ?? 0));
+                $total = (float) ($tx['total_amount'] ?? 0);
+                $remaining = max(0, $total - $paidTotal);
+                $status = $paymentStatus($total, $paidTotal);
+                $updateTxStmt = $pdo->prepare("UPDATE supplier_transactions SET paid_amount = ?, remaining_amount = ?, payment_status = ? WHERE id = ?");
+                $updateTxStmt->execute([$paidTotal, $remaining, $status, $transactionId]);
+            }
             $rebuildSupplierLedger($pdo, $supplierId);
             $pdo->commit();
-            $jsonResponse(true, __('suppliers.msg_payment_saved'));
+            $jsonResponse(true, __('suppliers.msg_payment_saved'), ['finance' => true]);
         }
 
         if ($action === 'delete_supplier_payment') {
@@ -1216,32 +1176,46 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $transactionId = (int) ($row['transaction_id'] ?? 0);
             $pdo->beginTransaction();
             $pdo->prepare("DELETE FROM supplier_payments WHERE id = ?")->execute([$paymentId]);
-            $txStmt = $pdo->prepare("SELECT total_amount FROM supplier_transactions WHERE id = ? LIMIT 1");
-            $txStmt->execute([$transactionId]);
-            $tx = $txStmt->fetch();
-            if ($tx) {
-                $sumStmt = $pdo->prepare("SELECT COALESCE(SUM(amount),0) AS paid_total FROM supplier_payments WHERE transaction_id = ?");
-                $sumStmt->execute([$transactionId]);
-                $paidTotal = (float) (($sumStmt->fetch()['paid_total'] ?? 0));
-                $total = (float) ($tx['total_amount'] ?? 0);
-                $remaining = max(0, $total - $paidTotal);
-                $status = $paymentStatus($total, $paidTotal);
-                $pdo->prepare("UPDATE supplier_transactions SET paid_amount = ?, remaining_amount = ?, payment_status = ? WHERE id = ?")
-                    ->execute([$paidTotal, $remaining, $status, $transactionId]);
+            if ($transactionId > 0) {
+                $txStmt = $pdo->prepare("SELECT total_amount FROM supplier_transactions WHERE id = ? LIMIT 1");
+                $txStmt->execute([$transactionId]);
+                $tx = $txStmt->fetch();
+                if ($tx) {
+                    $sumStmt = $pdo->prepare("SELECT COALESCE(SUM(amount),0) AS paid_total FROM supplier_payments WHERE transaction_id = ?");
+                    $sumStmt->execute([$transactionId]);
+                    $paidTotal = (float) (($sumStmt->fetch()['paid_total'] ?? 0));
+                    $total = (float) ($tx['total_amount'] ?? 0);
+                    $remaining = max(0, $total - $paidTotal);
+                    $status = $paymentStatus($total, $paidTotal);
+                    $pdo->prepare("UPDATE supplier_transactions SET paid_amount = ?, remaining_amount = ?, payment_status = ? WHERE id = ?")
+                        ->execute([$paidTotal, $remaining, $status, $transactionId]);
+                }
             }
             $rebuildSupplierLedger($pdo, $supplierId);
             $pdo->commit();
-            $jsonResponse(true, __('suppliers.msg_payment_deleted'));
+            $jsonResponse(true, __('suppliers.msg_payment_deleted'), ['finance' => true]);
         }
     } catch (Throwable $e) {
         if ($pdo->inTransaction()) {
             $pdo->rollBack();
         }
+        error_log('suppliers.php POST error: ' . $e->getMessage());
         $jsonResponse(false, __('suppliers.err_operation_failed'));
+    }
+    if (isset($_SERVER['HTTP_X_REQUESTED_WITH']) && strtolower((string) $_SERVER['HTTP_X_REQUESTED_WITH']) === 'xmlhttprequest') {
+        $jsonResponse(false, __('suppliers.err_unknown_action'));
     }
 }
 
+$pageAction = trim((string) ($_GET['action'] ?? ''));
+if ($pageAction === 'view_ledger') {
+    require __DIR__ . '/supplier_ledger_view.php';
+    exit;
+}
+
 $initialPayload = $buildPayload($pdo);
+$langQ = i18n_lang_query();
+$totalReceivedAllTime = financial_total_received_all_time($pdo);
 ob_start();
 ?>
 <style>
@@ -1258,7 +1232,12 @@ ob_start();
     }
 </style>
 
-<section class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4 mb-6" id="summaryCards">
+<section class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4 mb-6" id="summaryCards">
+    <a href="?module=cash<?= $langQ ?>" class="app-card supplier-card p-4 border border-teal-200 bg-gradient-to-br from-teal-50 to-white block no-underline text-inherit hover:border-teal-300 hover:shadow-md transition">
+        <p class="text-xs font-semibold uppercase tracking-wide text-teal-800"><?= e(__('dashboard.kpi_total_received')) ?></p>
+        <p id="suppTotalReceived" class="text-3xl font-bold text-teal-900 mt-2 tabular-nums break-all"><?= e(format_currency($totalReceivedAllTime)) ?></p>
+        <p class="text-xs text-teal-700/90 mt-1"><?= e(__('dashboard.kpi_total_received_sub')) ?></p>
+    </a>
     <div class="app-card supplier-card p-4">
         <p class="text-xs uppercase tracking-wide text-slate-500"><?= e(__('suppliers.kpi_total_suppliers')) ?></p>
         <p class="text-3xl font-bold text-oxygenDeep" data-key="suppliers"><?= (int) $initialPayload['summary']['suppliers'] ?></p>
@@ -1278,11 +1257,9 @@ ob_start();
 </section>
 
 <section class="app-card p-4 mb-6">
-    <div class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
+    <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <button type="button" class="btn btn-primary w-full" data-open-modal="addSupplierModal">[+] Add New Supplier</button>
         <a href="?module=suppliers_list<?= i18n_lang_query() ?>" class="btn btn-soft text-center w-full">[📂] View Supplier List</a>
-        <a href="?module=supplier_purchases<?= i18n_lang_query() ?>" class="btn btn-soft text-center w-full">[📄] Purchase Records</a>
-        <a href="?module=supplier_payments<?= i18n_lang_query() ?>" class="btn btn-soft text-center w-full">[💳] Payment History</a>
     </div>
 </section>
 
@@ -1292,29 +1269,32 @@ ob_start();
             <h3 class="font-semibold text-oxygenDeep"><?= e(__('suppliers.inventory_title')) ?></h3>
             <p class="text-xs text-slate-500"><?= e(__('suppliers.inventory_hint')) ?></p>
         </div>
-        <div class="flex flex-wrap items-center gap-2 text-xs">
-            <span class="rounded-full bg-sky-100 px-3 py-1 text-sky-800"><?= e(__('suppliers.stock_total')) ?>: <strong id="stockTotal"><?= e(number_format((float) $initialPayload['stockTotals']['total'], 2)) ?></strong> (<?= e(__('suppliers.pressure_psi')) ?> <strong id="stockTotalPressure"><?= e(number_format((float) ($initialPayload['stockTotals']['total_pressure'] ?? 0), 2)) ?></strong>)</span>
-            <span class="rounded-full bg-emerald-100 px-3 py-1 text-emerald-800"><?= e(__('suppliers.stock_available')) ?>: <strong id="stockAvailable"><?= e(number_format((float) $initialPayload['stockTotals']['available'], 2)) ?></strong> (<?= e(__('suppliers.pressure_psi')) ?> <strong id="stockAvailablePressure"><?= e(number_format((float) ($initialPayload['stockTotals']['available_pressure'] ?? 0), 2)) ?></strong>)</span>
+        <div class="flex flex-wrap items-center gap-2">
+            <div class="flex flex-wrap items-center gap-2 text-xs">
+                <span class="rounded-full bg-emerald-100 px-3 py-1 text-emerald-800"><?= e(__('suppliers.stock_daka')) ?>: <strong id="stockDaka"><?= (int) ($initialPayload['stockTotals']['daka'] ?? 0) ?></strong></span>
+                <span class="rounded-full bg-amber-100 px-3 py-1 text-amber-900"><?= e(__('suppliers.stock_tash')) ?>: <strong id="stockTash"><?= (int) ($initialPayload['stockTotals']['tash'] ?? 0) ?></strong></span>
+            </div>
+            <button type="button" class="btn btn-soft btn-sm" data-open-modal="stockSetupModal"><?= e(__('suppliers.btn_setup_stock')) ?></button>
         </div>
     </div>
-    <div class="grid grid-cols-1 sm:grid-cols-3 gap-3 mt-4" id="typedStockCards"></div>
 </section>
 
 <section class="grid grid-cols-1 gap-5 mb-6">
     <div class="app-card p-4 slide-up shadow-sm rounded-xl">
         <h3 class="font-semibold text-oxygenDeep mb-3"><?= e(__('suppliers.refill_dispatch_title')) ?></h3>
-        <form id="purchaseForm" class="space-y-4">
+        <div id="purchaseFormAlert" class="hidden rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800 mb-3" role="alert"></div>
+        <form id="purchaseForm" class="space-y-4" novalidate>
             <?php if (i18n_locale() === 'ps'): ?><input type="hidden" name="lang" value="ps"><?php endif; ?>
-            <input type="hidden" name="action" value="record_purchase">
+            <input type="hidden" name="purchase_action" value="record_purchase">
             <input type="hidden" name="purchase_id" value="">
             <input type="hidden" name="total_received" value="0" id="purchaseTotalReceived">
-            <input type="hidden" name="cylinder_type" id="purchaseCylinderTypeHidden" value="Small">
+            <input type="hidden" name="cylinder_type" id="purchaseCylinderTypeHidden" value="<?= e(standard_cylinder_size()) ?>">
             <p class="text-xs text-slate-500 hidden" id="totalSentAllTimeLine"></p>
             <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
                 <label class="block">
                     <span class="block text-xs font-medium text-slate-600 mb-1"><?= e(__('suppliers.label_supplier')) ?></span>
                     <div class="flex flex-wrap items-center gap-2">
-                        <select name="supplier_id" required class="app-input flex-1 min-w-[160px]" id="purchaseSupplier"></select>
+                        <select name="supplier_id" class="app-input flex-1 min-w-[160px]" id="purchaseSupplier"></select>
                         <span id="supplierPendingBadge" class="inline-flex items-center gap-1 rounded-full border border-amber-200 bg-amber-50 px-2.5 py-1 text-[11px] font-medium text-amber-900 cursor-help" title=""><?= e(__('suppliers.badge_history')) ?></span>
                     </div>
                 </label>
@@ -1324,39 +1304,11 @@ ob_start();
                 </label>
             </div>
             <p class="text-xs text-slate-500 mb-1"><?= e(__('suppliers.dispatch_trip_hint')) ?></p>
-            <div class="overflow-x-auto rounded-xl border border-indigo-100 bg-indigo-50/50 p-2">
-                <table class="w-full text-sm min-w-[640px]">
-                    <thead class="bg-white/90"><tr>
-                        <th class="p-2 text-start"><?= e(__('suppliers.col_size')) ?></th>
-                        <th class="p-2 text-start"><?= e(__('suppliers.col_sent_qty')) ?></th>
-                        <th class="p-2 text-start"><?= e(__('suppliers.col_sent_pressure')) ?></th>
-                        <th class="p-2 text-end"><?= e(__('suppliers.col_trip_subtotal')) ?></th>
-                    </tr></thead>
-                    <tbody>
-                        <tr class="border-t border-indigo-100/80">
-                            <td class="p-2 font-medium text-slate-700"><?= e(cylinder_size_label('Small')) ?></td>
-                            <td class="p-2"><input name="sent_qty_Small" type="number" min="0" value="0" class="app-input dispatch-sent-qty" data-size="Small"></td>
-                            <td class="p-2"><input name="sent_pressure_Small" type="number" step="0.01" min="0" class="app-input dispatch-sent-pressure" data-size="Small" placeholder="<?= e(__('common.optional')) ?>"></td>
-                            <td class="p-2 text-end text-slate-600"><span id="dispatchSubSmall">0</span></td>
-                        </tr>
-                        <tr class="border-t border-indigo-100/80">
-                            <td class="p-2 font-medium text-slate-700"><?= e(cylinder_size_label('Medium')) ?></td>
-                            <td class="p-2"><input name="sent_qty_Medium" type="number" min="0" value="0" class="app-input dispatch-sent-qty" data-size="Medium"></td>
-                            <td class="p-2"><input name="sent_pressure_Medium" type="number" step="0.01" min="0" class="app-input dispatch-sent-pressure" data-size="Medium" placeholder="<?= e(__('common.optional')) ?>"></td>
-                            <td class="p-2 text-end text-slate-600"><span id="dispatchSubMedium">0</span></td>
-                        </tr>
-                        <tr class="border-t border-indigo-100/80">
-                            <td class="p-2 font-medium text-slate-700"><?= e(cylinder_size_label('Large')) ?></td>
-                            <td class="p-2"><input name="sent_qty_Large" type="number" min="0" value="0" class="app-input dispatch-sent-qty" data-size="Large"></td>
-                            <td class="p-2"><input name="sent_pressure_Large" type="number" step="0.01" min="0" class="app-input dispatch-sent-pressure" data-size="Large" placeholder="<?= e(__('common.optional')) ?>"></td>
-                            <td class="p-2 text-end text-slate-600"><span id="dispatchSubLarge">0</span></td>
-                        </tr>
-                    </tbody>
-                    <tfoot class="bg-white/90 font-medium text-slate-800"><tr>
-                        <td class="p-2" colspan="3"><?= e(__('suppliers.total_sent_trip')) ?></td>
-                        <td class="p-2 text-end"><span id="dispatchSentGrand">0</span></td>
-                    </tr></tfoot>
-                </table>
+            <div class="grid grid-cols-1 gap-3 rounded-xl border border-indigo-100 bg-indigo-50/50 p-3">
+                <label class="block">
+                    <span class="block text-xs font-medium text-slate-600 mb-1"><?= e(__('suppliers.col_sent_qty')) ?> <span class="text-slate-400 font-normal">(<?= e(__('suppliers.dispatch_tash_hint')) ?>)</span></span>
+                    <input name="sent_qty" type="number" min="0" value="0" class="app-input" id="dispatchSentQty">
+                </label>
             </div>
             <div class="rounded-lg border border-sky-200 bg-sky-50/80 px-3 py-2 text-xs text-sky-950">
                 <span class="font-semibold text-sky-900"><?= e(__('suppliers.pending_bakee_title')) ?></span>
@@ -1366,58 +1318,31 @@ ob_start();
             <div class="rounded-xl border border-slate-200 p-3 bg-slate-50">
                 <h4 class="font-semibold text-oxygenDeep mb-2"><?= e(__('suppliers.reconciliation_title')) ?></h4>
                 <p class="text-xs text-slate-500 mb-3"><?= e(__('suppliers.reconciliation_hint')) ?></p>
-                <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3 mb-3">
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mb-3">
                     <label class="block">
                         <span class="block text-xs font-medium text-slate-600 mb-1"><?= e(__('suppliers.label_receipt_date')) ?></span>
                         <input name="transaction_date" type="date" class="app-input" value="<?= date('Y-m-d') ?>">
                     </label>
                     <label class="block">
-                        <span class="block text-xs font-medium text-slate-600 mb-1"><?= e(__('suppliers.label_default_unit_price')) ?></span>
-                        <input name="unit_price" type="number" step="0.01" min="0" class="app-input" placeholder="<?= e(__('suppliers.ph_fallback_unit')) ?>">
+                        <span class="block text-xs font-medium text-slate-600 mb-1"><?= e(__('suppliers.label_daka_added')) ?></span>
+                        <input name="inventory_qty_preview" readonly class="app-input bg-slate-100" placeholder="0">
+                    </label>
+                </div>
+                <div id="refillBreakdownBody" class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-3">
+                    <label class="block">
+                        <span class="block text-xs font-medium text-slate-600 mb-1"><?= e(__('suppliers.col_received_qty')) ?> <span class="text-slate-400 font-normal">(<?= e(__('suppliers.receipt_daka_hint')) ?>)</span></span>
+                        <input name="recv_qty" type="number" min="1" value="" class="app-input recv-qty" id="recvQty" placeholder="0">
                     </label>
                     <label class="block">
-                        <span class="block text-xs font-medium text-slate-600 mb-1"><?= e(__('suppliers.label_inventory_qty_total')) ?></span>
-                        <input name="inventory_qty_preview" readonly class="app-input bg-slate-100" placeholder="0.00">
+                        <span class="block text-xs font-medium text-slate-600 mb-1"><?= e(__('suppliers.col_total_price')) ?></span>
+                        <input name="recv_total_price" type="number" step="0.01" min="0" class="app-input recv-total" id="recvTotalPrice" placeholder="<?= e(__('suppliers.ph_total_price_required')) ?>">
+                    </label>
+                    <label class="block">
+                        <span class="block text-xs font-medium text-slate-600 mb-1"><?= e(__('suppliers.col_pending_supplier')) ?></span>
+                        <input type="text" readonly class="app-input bg-slate-100 recv-pending" id="recvPending" value="0">
                     </label>
                 </div>
-                <div class="overflow-x-auto">
-                    <table class="w-full text-sm min-w-[920px]">
-                        <thead class="bg-white"><tr>
-                            <th class="p-2 text-start"><?= e(__('suppliers.col_size')) ?></th>
-                            <th class="p-2 text-start"><?= e(__('suppliers.col_received_qty')) ?></th>
-                            <th class="p-2 text-start"><?= e(__('suppliers.col_pressure_received')) ?></th>
-                            <th class="p-2 text-start"><?= e(__('suppliers.col_unit_price')) ?></th>
-                            <th class="p-2 text-start"><?= e(__('suppliers.col_pending_supplier')) ?></th>
-                            <th class="p-2 text-end"><?= e(__('suppliers.col_line_total')) ?></th>
-                        </tr></thead>
-                        <tbody id="refillBreakdownBody">
-                            <tr class="border-t border-slate-100" data-recv-row="Small">
-                                <td class="p-2 font-medium text-slate-700"><?= e(cylinder_size_label('Small')) ?></td>
-                                <td class="p-2"><input name="recv_qty_Small" type="number" min="0" value="0" class="app-input recv-qty" data-size="Small"></td>
-                                <td class="p-2"><input name="recv_pressure_Small" type="number" step="0.01" min="0" class="app-input recv-pressure" data-size="Small" placeholder="<?= e(__('suppliers.ph_psi')) ?>"></td>
-                                <td class="p-2"><input name="recv_unit_price_Small" type="number" step="0.01" min="0" class="app-input recv-unit" data-size="Small" placeholder="<?= e(__('suppliers.ph_use_default')) ?>"></td>
-                                <td class="p-2"><input type="text" readonly class="app-input bg-slate-100 recv-pending" data-size="Small" value="0"></td>
-                                <td class="p-2 text-end"><span class="recv-line-total font-medium text-slate-800" data-size="Small"><?= e(__('currency.symbol')) ?> 0.00</span></td>
-                            </tr>
-                            <tr class="border-t border-slate-100" data-recv-row="Medium">
-                                <td class="p-2 font-medium text-slate-700"><?= e(cylinder_size_label('Medium')) ?></td>
-                                <td class="p-2"><input name="recv_qty_Medium" type="number" min="0" value="0" class="app-input recv-qty" data-size="Medium"></td>
-                                <td class="p-2"><input name="recv_pressure_Medium" type="number" step="0.01" min="0" class="app-input recv-pressure" data-size="Medium" placeholder="<?= e(__('suppliers.ph_psi')) ?>"></td>
-                                <td class="p-2"><input name="recv_unit_price_Medium" type="number" step="0.01" min="0" class="app-input recv-unit" data-size="Medium" placeholder="<?= e(__('suppliers.ph_use_default')) ?>"></td>
-                                <td class="p-2"><input type="text" readonly class="app-input bg-slate-100 recv-pending" data-size="Medium" value="0"></td>
-                                <td class="p-2 text-end"><span class="recv-line-total font-medium text-slate-800" data-size="Medium"><?= e(__('currency.symbol')) ?> 0.00</span></td>
-                            </tr>
-                            <tr class="border-t border-slate-100" data-recv-row="Large">
-                                <td class="p-2 font-medium text-slate-700"><?= e(cylinder_size_label('Large')) ?></td>
-                                <td class="p-2"><input name="recv_qty_Large" type="number" min="0" value="0" class="app-input recv-qty" data-size="Large"></td>
-                                <td class="p-2"><input name="recv_pressure_Large" type="number" step="0.01" min="0" class="app-input recv-pressure" data-size="Large" placeholder="<?= e(__('suppliers.ph_psi')) ?>"></td>
-                                <td class="p-2"><input name="recv_unit_price_Large" type="number" step="0.01" min="0" class="app-input recv-unit" data-size="Large" placeholder="<?= e(__('suppliers.ph_use_default')) ?>"></td>
-                                <td class="p-2"><input type="text" readonly class="app-input bg-slate-100 recv-pending" data-size="Large" value="0"></td>
-                                <td class="p-2 text-end"><span class="recv-line-total font-medium text-slate-800" data-size="Large"><?= e(__('currency.symbol')) ?> 0.00</span></td>
-                            </tr>
-                        </tbody>
-                    </table>
-                </div>
+                <p class="mt-2 text-end text-sm font-medium text-slate-800"><?= e(__('suppliers.col_line_total')) ?>: <span class="recv-line-total" id="recvLineTotal"><?= e(__('currency.symbol')) ?> 0.00</span></p>
             </div>
 
             <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
@@ -1435,20 +1360,57 @@ ob_start();
                 </label>
                 <label class="block">
                     <span class="block text-xs font-medium text-slate-600 mb-1"><?= e(__('suppliers.label_payment_type')) ?></span>
-                    <select name="payment_type" required class="app-input">
+                    <select name="payment_type" class="app-input">
                         <option value="Cash"><?= e(__('suppliers.pay_cash')) ?></option>
                         <option value="Bank"><?= e(__('suppliers.pay_bank')) ?></option>
                         <option value="Credit"><?= e(__('suppliers.pay_credit')) ?></option>
                     </select>
                 </label>
             </div>
+            <label class="block">
+                <span class="block text-xs font-medium text-slate-600 mb-1"><?= e(__('suppliers.label_transaction_description')) ?></span>
+                <textarea name="transaction_notes" rows="2" class="app-input" placeholder="<?= e(__('suppliers.ph_transaction_description')) ?>"></textarea>
+            </label>
             <div class="flex flex-wrap gap-2">
-                <button class="btn btn-primary" id="purchaseSubmitBtn"><?= e(__('suppliers.btn_save_receipt')) ?></button>
+                <button type="button" class="btn btn-primary" id="purchaseSubmitBtn"><?= e(__('suppliers.btn_save_receipt')) ?></button>
                 <button type="button" class="btn btn-soft hidden" id="purchaseResetBtn"><?= e(__('suppliers.btn_cancel_edit')) ?></button>
             </div>
         </form>
     </div>
 </section>
+
+<div id="stockSetupModal" class="fixed inset-0 z-50 hidden items-end sm:items-center justify-center p-4">
+    <div class="absolute inset-0 bg-slate-900/50" data-close-modal="stockSetupModal"></div>
+    <div class="relative w-full max-w-md app-card p-5">
+        <div class="flex items-center justify-between mb-3">
+            <h3 class="font-semibold text-oxygenDeep"><?= e(__('suppliers.stock_setup_title')) ?></h3>
+            <button type="button" class="btn btn-soft" data-close-modal="stockSetupModal"><?= e(__('common.close')) ?></button>
+        </div>
+        <p class="text-xs text-slate-500 mb-4"><?= e(__('suppliers.stock_setup_hint')) ?></p>
+        <form id="stockSetupForm" class="space-y-3" novalidate>
+            <?php if (i18n_locale() === 'ps'): ?><input type="hidden" name="lang" value="ps"><?php endif; ?>
+            <input type="hidden" name="action" value="adjust_cylinder_stock">
+            <label class="block">
+                <span class="block text-xs font-medium text-slate-600 mb-1"><?= e(__('suppliers.label_stock_mode')) ?></span>
+                <select name="stock_mode" class="app-input" id="stockModeSelect">
+                    <option value="set"><?= e(__('suppliers.stock_mode_set')) ?></option>
+                    <option value="add"><?= e(__('suppliers.stock_mode_add')) ?></option>
+                </select>
+            </label>
+            <input type="hidden" name="cylinder_type" value="<?= e(standard_cylinder_size()) ?>">
+            <p class="text-xs text-slate-600 rounded-lg bg-slate-50 px-3 py-2" id="stockCurrentLine">—</p>
+            <label class="block">
+                <span class="block text-xs font-medium text-slate-600 mb-1"><?= e(__('suppliers.label_stock_daka_qty')) ?></span>
+                <input name="daka_qty" type="number" min="0" step="1" class="app-input" id="stockDakaInput" placeholder="0">
+            </label>
+            <label class="block">
+                <span class="block text-xs font-medium text-slate-600 mb-1"><?= e(__('suppliers.label_stock_tash_qty')) ?></span>
+                <input name="tash_qty" type="number" min="0" step="1" class="app-input" id="stockTashInput" placeholder="0">
+            </label>
+            <button type="submit" class="btn btn-primary w-full" id="stockSetupSubmitBtn"><?= e(__('suppliers.btn_apply_stock')) ?></button>
+        </form>
+    </div>
+</div>
 
 <div id="addSupplierModal" class="fixed inset-0 z-50 hidden items-end sm:items-center justify-center p-4">
     <div class="absolute inset-0 bg-slate-900/50" data-close-modal="addSupplierModal"></div>
@@ -1465,7 +1427,11 @@ ob_start();
             <input name="phone" required class="app-input" placeholder="<?= e(__('suppliers.ph_phone')) ?>">
             <input name="email" type="email" class="app-input" placeholder="<?= e(__('suppliers.ph_email')) ?>">
             <textarea name="address" class="app-input" placeholder="<?= e(__('suppliers.ph_address')) ?>"></textarea>
-            <input name="opening_balance" type="number" step="0.01" min="0" class="app-input" placeholder="<?= e(__('suppliers.ph_opening_balance')) ?>">
+            <label class="block">
+                <span class="text-xs font-medium text-slate-600"><?= e(__('suppliers.opening_balance')) ?></span>
+                <input name="opening_balance" type="number" step="0.01" min="0" class="app-input mt-1" placeholder="<?= e(__('suppliers.ph_opening_balance')) ?>">
+                <span class="text-xs text-slate-500 mt-1 block"><?= e(__('suppliers.opening_balance_hint')) ?></span>
+            </label>
             <button class="btn btn-primary w-full"><?= e(__('suppliers.btn_save_supplier')) ?></button>
         </form>
     </div>
@@ -1554,7 +1520,6 @@ ob_start();
             <thead class="bg-slate-50"><tr>
                 <th class="text-start p-3"><?= e(__('suppliers.col_date')) ?></th>
                 <th class="text-start p-3"><?= e(__('suppliers.col_supplier')) ?></th>
-                <th class="text-start p-3"><?= e(__('suppliers.col_type')) ?></th>
                 <th class="text-start p-3"><?= e(__('suppliers.col_sent')) ?></th>
                 <th class="text-start p-3"><?= e(__('suppliers.col_received')) ?></th>
                 <th class="text-start p-3"><?= e(__('suppliers.col_inventory_qty')) ?></th>
@@ -1576,39 +1541,12 @@ ob_start();
             <h3 class="text-lg font-semibold text-oxygenDeep"><?= e(__('suppliers.modal_history_title')) ?></h3>
             <button class="btn btn-soft shrink-0" data-close-history="1"><?= e(__('common.close')) ?></button>
         </div>
-        <h4 class="text-sm font-semibold mb-2 text-oxygenDeep"><?= e(__('suppliers.modal_purchase_history')) ?></h4>
-        <p class="text-xs text-slate-500 mb-2"><?= e(__('suppliers.modal_purchase_hint')) ?></p>
-        <div class="overflow-x-auto mb-4 -mx-1 px-1">
-            <table class="w-full text-sm min-w-[1100px] border border-slate-200 rounded-lg overflow-hidden">
-                <thead class="bg-slate-50"><tr>
-                    <th class="p-2 text-start whitespace-nowrap"><?= e(__('suppliers.col_date')) ?></th>
-                    <th class="p-2 text-start min-w-[220px]"><?= e(__('suppliers.col_size_breakdown')) ?></th>
-                    <th class="p-2 text-start whitespace-nowrap"><?= e(__('suppliers.col_sent_pressure')) ?></th>
-                    <th class="p-2 text-start whitespace-nowrap"><?= e(__('suppliers.col_recv_pressure')) ?></th>
-                    <th class="p-2 text-start whitespace-nowrap"><?= e(__('suppliers.col_unit_price')) ?></th>
-                    <th class="p-2 text-end whitespace-nowrap"><?= e(__('suppliers.col_total')) ?></th>
-                    <th class="p-2 text-start whitespace-nowrap"><?= e(__('common.status')) ?></th>
-                </tr></thead>
-                <tbody id="historyPurchaseBody"></tbody>
-            </table>
-        </div>
+        <h4 class="text-sm font-semibold mb-2 text-oxygenDeep"><?= e(__('suppliers.modal_bills_title')) ?></h4>
+        <p class="text-xs text-slate-500 mb-2"><?= e(__('suppliers.modal_bills_hint')) ?></p>
+        <div id="historyBillsList" class="space-y-3 mb-4 max-h-[min(52vh,520px)] overflow-y-auto pe-1"></div>
         <div id="historyPendingBakee" class="mb-4 rounded-xl border border-amber-200 bg-amber-50/80 px-3 py-3 text-sm text-amber-950">
             <span class="font-semibold"><?= e(__('suppliers.pending_at_supplier_bakee')) ?></span>
             <p class="mt-1 text-xs sm:text-sm" id="historyPendingBakeeBody">—</p>
-        </div>
-        <h4 class="text-sm font-semibold mb-2 text-oxygenDeep"><?= e(__('suppliers.modal_ledger_entries')) ?></h4>
-        <div class="overflow-x-auto mb-4 -mx-1 px-1">
-            <table class="w-full text-sm min-w-[1000px] border border-slate-200 rounded-lg overflow-hidden">
-                <thead class="bg-slate-50"><tr>
-                    <th class="p-2 text-start whitespace-nowrap"><?= e(__('suppliers.col_date')) ?></th>
-                    <th class="p-2 text-start min-w-[200px]"><?= e(__('suppliers.col_description')) ?></th>
-                    <th class="p-2 text-start whitespace-nowrap"><?= e(__('suppliers.col_pending_at_supplier_short')) ?></th>
-                    <th class="p-2 text-end whitespace-nowrap"><?= e(__('suppliers.col_debit')) ?></th>
-                    <th class="p-2 text-end whitespace-nowrap"><?= e(__('suppliers.col_credit')) ?></th>
-                    <th class="p-2 text-end whitespace-nowrap"><?= e(__('suppliers.col_balance')) ?></th>
-                </tr></thead>
-                <tbody id="historyLedgerBody"></tbody>
-            </table>
         </div>
         <h4 class="text-sm font-semibold mt-4 mb-2 text-oxygenDeep"><?= e(__('suppliers.modal_installments')) ?></h4>
         <form id="ledgerPaymentForm" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-3 mb-3">
@@ -1657,9 +1595,7 @@ ob_start();
 
 <?php
 $supplierJs = [
-    'sizeSmall' => cylinder_size_label('Small'),
-    'sizeMedium' => cylinder_size_label('Medium'),
-    'sizeLarge' => cylinder_size_label('Large'),
+    'cylinderStandard' => cylinder_size_label(standard_cylinder_size()),
     'stockTotal' => __('suppliers.stock_total'),
     'stockAvailable' => __('suppliers.stock_available'),
     'pressurePsi' => __('suppliers.pressure_psi'),
@@ -1706,6 +1642,21 @@ $supplierJs = [
     'statusPaid' => __('suppliers.status_paid'),
     'statusPartial' => __('suppliers.status_partial'),
     'statusDue' => __('suppliers.status_due'),
+    'colReceivedQty' => __('suppliers.col_received_qty'),
+    'colBillTotal' => __('suppliers.col_total_price'),
+    'colPaid' => __('suppliers.col_paid'),
+    'colRemaining' => __('suppliers.label_remaining_amount'),
+    'colPaymentType' => __('suppliers.label_payment_type'),
+    'colDescription' => __('suppliers.col_description'),
+    'billRef' => __('suppliers.col_purchase_ref'),
+    'noBills' => __('suppliers.no_purchase_history'),
+    'errSelectSupplier' => __('suppliers.err_select_supplier'),
+    'errRecvQty' => __('suppliers.err_recv_qty_required'),
+    'errTotalPrice' => __('suppliers.err_total_price_required'),
+    'errRequestFailed' => __('suppliers.err_request_failed'),
+    'emptyNoSuppliers' => __('suppliers.empty_no_suppliers'),
+    'stockCurrentLine' => __('suppliers.stock_current_line'),
+    'errStockQty' => __('suppliers.err_stock_qty_required'),
 ];
 ?>
 <script>
@@ -1725,19 +1676,46 @@ $supplierJs = [
     };
     const statusClass = (status) => status === 'PAID' ? 'status-paid' : (status === 'PARTIAL' ? 'status-partial' : 'status-due');
     const toast = document.getElementById('toast');
+    const purchaseFormAlert = document.getElementById('purchaseFormAlert');
     const showToast = (message) => {
         if (!toast || !message) return;
         toast.textContent = message;
         toast.classList.remove('hidden');
         setTimeout(() => toast.classList.add('hidden'), 2200);
     };
+    const showPurchaseAlert = (message) => {
+        if (!message) {
+            if (purchaseFormAlert) {
+                purchaseFormAlert.textContent = '';
+                purchaseFormAlert.classList.add('hidden');
+            }
+            return;
+        }
+        showToast(message);
+        if (purchaseFormAlert) {
+            purchaseFormAlert.textContent = message;
+            purchaseFormAlert.classList.remove('hidden');
+            purchaseFormAlert.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }
+    };
     const request = async (body) => {
-        const response = await fetch(window.location.href, {
-            method: 'POST',
-            headers: { 'X-Requested-With': 'XMLHttpRequest' },
-            body
-        });
-        return response.json();
+        try {
+            const response = await fetch(window.location.href, {
+                method: 'POST',
+                headers: { 'X-Requested-With': 'XMLHttpRequest' },
+                body
+            });
+            const text = await response.text();
+            try {
+                return JSON.parse(text);
+            } catch (parseErr) {
+                console.error('Invalid JSON response', text);
+                return { ok: false, message: t.errRequestFailed };
+            }
+        } catch (networkErr) {
+            console.error(networkErr);
+            return { ok: false, message: t.errRequestFailed };
+        }
     };
 
     let currentData = data;
@@ -1749,7 +1727,6 @@ $supplierJs = [
     const purchaseTbody = document.getElementById('purchaseTbody');
     const purchaseSupplier = document.getElementById('purchaseSupplier');
     const supplierFilter = document.getElementById('supplierFilter');
-    const typedStockCards = document.getElementById('typedStockCards');
     const historyModal = document.getElementById('historyModal');
     const ledgerPaymentForm = document.getElementById('ledgerPaymentForm');
     const ledgerPaymentSubmitBtn = document.getElementById('ledgerPaymentSubmitBtn');
@@ -1761,125 +1738,209 @@ $supplierJs = [
     const previousPendingLine = document.getElementById('previousPendingLine');
     const supplierPendingBadge = document.getElementById('supplierPendingBadge');
     const totalSentAllTimeLine = document.getElementById('totalSentAllTimeLine');
-    const SIZES = ['Small', 'Medium', 'Large'];
+    const STANDARD_SIZE = <?= json_encode(standard_cylinder_size(), JSON_UNESCAPED_UNICODE) ?>;
     let editPurchaseRow = null;
-    const sizeLabel = (code) => (code === 'Small' ? t.sizeSmall : code === 'Medium' ? t.sizeMedium : code === 'Large' ? t.sizeLarge : code);
+
+    const purchaseActionField = () => purchaseForm?.querySelector('input[name="purchase_action"]');
+    const setPurchaseAction = (value) => {
+        const field = purchaseActionField();
+        if (field) field.value = value;
+    };
+
+    const hasSuppliers = () => (currentData.supplierOptions || []).length > 0;
+
+    const updatePurchaseEmptyState = () => {
+        const empty = !hasSuppliers();
+        if (purchaseSubmitBtn) {
+            purchaseSubmitBtn.disabled = empty;
+            purchaseSubmitBtn.title = empty ? (t.emptyNoSuppliers || '') : '';
+        }
+        if (purchaseSupplier) {
+            purchaseSupplier.disabled = empty;
+        }
+    };
+
+    const validatePurchaseForm = () => {
+        showPurchaseAlert('');
+        if (!purchaseForm || !purchaseSupplier) {
+            showPurchaseAlert(t.errRequestFailed);
+            return false;
+        }
+        if (!hasSuppliers()) {
+            showPurchaseAlert(t.emptyNoSuppliers || t.errSelectSupplier);
+            return false;
+        }
+        const supplierId = Number(purchaseSupplier.value || 0);
+        if (supplierId <= 0) {
+            showPurchaseAlert(t.errSelectSupplier);
+            purchaseSupplier.focus();
+            return false;
+        }
+        const recvQty = Number(purchaseForm.elements.recv_qty?.value || purchaseForm.recv_qty?.value || 0);
+        if (recvQty <= 0) {
+            showPurchaseAlert(t.errRecvQty);
+            (purchaseForm.elements.recv_qty || purchaseForm.recv_qty)?.focus();
+            return false;
+        }
+        const totalPrice = Number(purchaseForm.elements.recv_total_price?.value || purchaseForm.recv_total_price?.value || 0);
+        if (totalPrice <= 0) {
+            showPurchaseAlert(t.errTotalPrice);
+            (purchaseForm.elements.recv_total_price || purchaseForm.recv_total_price)?.focus();
+            return false;
+        }
+        return true;
+    };
+
+    const savePurchase = async () => {
+        if (!purchaseForm) {
+            showPurchaseAlert(t.errRequestFailed);
+            return;
+        }
+        if (!validatePurchaseForm()) return;
+        calcPurchase();
+        const body = new FormData(purchaseForm);
+        if (!body.get('purchase_action')) {
+            body.set('purchase_action', purchaseActionField()?.value || 'record_purchase');
+        }
+        if (purchaseSubmitBtn) purchaseSubmitBtn.disabled = true;
+        const result = await request(body);
+        updatePurchaseEmptyState();
+        showToast(result.message || t.saved);
+        if (!result.ok) {
+            if (result.message) showPurchaseAlert(result.message);
+            return;
+        }
+        showPurchaseAlert('');
+        editPurchaseRow = null;
+        purchaseForm.reset();
+        setPurchaseAction('record_purchase');
+        const purchaseIdField = purchaseForm.elements.purchase_id || purchaseForm.purchase_id;
+        if (purchaseIdField) purchaseIdField.value = '';
+        if (purchaseSubmitBtn) purchaseSubmitBtn.textContent = t.saveReceipt;
+        if (purchaseResetBtn) purchaseResetBtn.classList.add('hidden');
+        const txDate = purchaseForm.elements.transaction_date || purchaseForm.transaction_date;
+        const sentDate = purchaseForm.elements.date_sent || purchaseForm.date_sent;
+        if (txDate) txDate.value = '<?= date('Y-m-d') ?>';
+        if (sentDate) sentDate.value = '<?= date('Y-m-d') ?>';
+        resetDispatchRows();
+        resetRecvRows();
+        const trEl = document.getElementById('purchaseTotalReceived');
+        if (trEl) trEl.value = '0';
+        calcPurchase();
+        currentData = result.data;
+        renderAll();
+        refreshSupplierContextUI();
+        if (window.OxygenFinance?.notify) {
+            window.OxygenFinance.notify({ source: 'supplier_purchase' });
+        }
+    };
+
+    const sizeLabel = () => t.cylinderStandard || 'Cylinder';
     const mapPayStatus = (s) => (s === 'PAID' || s === 'Paid' ? t.statusPaid : s === 'PARTIAL' || s === 'Partial' ? t.statusPartial : s === 'DUE' || s === 'Due' ? t.statusDue : s);
+
+    const pendingTotal = (entry) => {
+        if (!entry) return 0;
+        return Number(entry.total ?? 0);
+    };
 
     const getPendingEntry = (supplierId) => {
         const map = currentData.pendingBySupplier || {};
-        return map[String(supplierId)] || map[supplierId] || { Small: 0, Medium: 0, Large: 0, total: 0 };
+        return map[String(supplierId)] || map[supplierId] || { total: 0 };
     };
 
-    const parseSentFromPurchaseRow = (row) => {
-        if (row == null) return { Small: 0, Medium: 0, Large: 0 };
+    const parseSentQtyFromPurchaseRow = (row) => {
+        if (row == null) return 0;
         const s = Number(row.sent_qty_small ?? 0);
         const m = Number(row.sent_qty_medium ?? 0);
         const l = Number(row.sent_qty_large ?? 0);
-        if (s + m + l > 0) {
-            return { Small: s, Medium: m, Large: l };
-        }
-        const t = row.cylinder_type || 'Small';
-        const sq = Number(row.sent_quantity || 0);
-        if (t === 'Mixed') {
-            return { Small: 0, Medium: 0, Large: 0 };
-        }
-        return {
-            Small: t === 'Small' ? sq : 0,
-            Medium: t === 'Medium' ? sq : 0,
-            Large: t === 'Large' ? sq : 0,
-        };
+        if (s + m + l > 0) return s + m + l;
+        return Number(row.sent_quantity || 0);
     };
 
-    const parseRecvFromPurchaseRow = (row) => {
-        const out = { Small: 0, Medium: 0, Large: 0 };
-        const raw = row.breakdown_data || '';
-        if (!raw) return out;
+    const parseRecvQtyFromPurchaseRow = (row) => {
+        let total = 0;
+        const raw = row?.breakdown_data || '';
+        if (!raw) return total;
         String(raw).split('||').forEach((entry) => {
             const p = entry.split('::');
             if (p.length >= 6) {
-                const size = (p[0] || '').trim() || (row.cylinder_type || 'Small');
-                if (SIZES.includes(size)) {
-                    out[size] += Number(p[2] || 0);
-                }
+                total += Number(p[2] || 0);
             } else if (p.length >= 3) {
-                const qty = Number(p[1] || 0);
-                const ct = row.cylinder_type || 'Small';
-                out[ct] += qty;
+                total += Number(p[1] || 0);
             }
         });
-        return out;
+        return total;
     };
 
-    const openingPendingForSize = (supplierId, size, editRow) => {
-        const live = Number(getPendingEntry(supplierId)[size] || 0);
+    const openingPending = (supplierId, editRow) => {
+        const live = pendingTotal(getPendingEntry(supplierId));
         if (!editRow || !editRow.id) return live;
-        const sent = parseSentFromPurchaseRow(editRow);
-        const recv = parseRecvFromPurchaseRow(editRow);
-        const net = Number(sent[size] || 0) - Number(recv[size] || 0);
-        return live - net;
+        const sent = parseSentQtyFromPurchaseRow(editRow);
+        const recv = parseRecvQtyFromPurchaseRow(editRow);
+        return live - (sent - recv);
     };
 
     const parseBreakdownForForm = (row) => {
-        const qty = { Small: 0, Medium: 0, Large: 0 };
-        const pressure = { Small: '', Medium: '', Large: '' };
-        const unit = { Small: '', Medium: '', Large: '' };
-        const raw = row.breakdown_data || '';
+        let qty = 0;
+        let pressure = '';
+        const raw = row?.breakdown_data || '';
         if (raw) {
             String(raw).split('||').forEach((entry) => {
                 const p = entry.split('::');
                 if (p.length >= 6) {
-                    const size = (p[0] || '').trim() || (row.cylinder_type || 'Small');
-                    if (!SIZES.includes(size)) return;
-                    qty[size] = Number(p[2] || 0);
-                    pressure[size] = p[3] !== undefined && p[3] !== '' && Number(p[3]) !== 0 ? String(p[3]) : '';
-                    unit[size] = p[4] !== undefined && p[4] !== '' && Number(p[4]) !== 0 ? String(p[4]) : '';
+                    qty += Number(p[2] || 0);
+                    if (!pressure && p[3] !== undefined && p[3] !== '' && Number(p[3]) !== 0) pressure = String(p[3]);
                 } else if (p.length >= 3) {
-                    const ct = row.cylinder_type || 'Small';
-                    qty[ct] += Number(p[1] || 0);
+                    qty += Number(p[1] || 0);
                 }
             });
         }
-        return { qty, pressure, unit };
+        const total = Number(row?.total_amount || 0);
+        return { qty, pressure, total };
+    };
+
+    const sentPressureFromRow = (row) => {
+        const keys = ['sent_pressure_small', 'sent_pressure_medium', 'sent_pressure_large', 'sent_pressure'];
+        for (const k of keys) {
+            const v = row?.[k];
+            if (v != null && v !== '') return String(v);
+        }
+        return '';
     };
 
     const renderSummary = () => {
-        document.querySelector('#summaryCards [data-key="suppliers"]').textContent = String(currentData.summary.suppliers);
-        document.querySelector('#summaryCards [data-key="purchases"]').textContent = fmt(currentData.summary.purchases);
-        document.querySelector('#summaryCards [data-key="pending"]').textContent = fmt(currentData.summary.pending);
-        document.querySelector('#summaryCards [data-key="paid"]').textContent = fmt(currentData.summary.paid);
-        document.getElementById('stockTotal').textContent = Number(currentData.stockTotals.total || 0).toFixed(2);
-        document.getElementById('stockAvailable').textContent = Number(currentData.stockTotals.available || 0).toFixed(2);
-        const totalPressureEl = document.getElementById('stockTotalPressure');
-        const availablePressureEl = document.getElementById('stockAvailablePressure');
-        if (totalPressureEl) totalPressureEl.textContent = Number(currentData.stockTotals.total_pressure || 0).toFixed(2);
-        if (availablePressureEl) availablePressureEl.textContent = Number(currentData.stockTotals.available_pressure || 0).toFixed(2);
+        const summary = currentData.summary || {};
+        const stockTotals = currentData.stockTotals || {};
+        const setKpi = (key, value) => {
+            const el = document.querySelector(`#summaryCards [data-key="${key}"]`);
+            if (el) el.textContent = value;
+        };
+        setKpi('suppliers', String(summary.suppliers ?? 0));
+        setKpi('purchases', fmt(summary.purchases ?? 0));
+        setKpi('pending', fmt(summary.pending ?? 0));
+        setKpi('paid', fmt(summary.paid ?? 0));
+        const stockDakaEl = document.getElementById('stockDaka');
+        const stockTashEl = document.getElementById('stockTash');
+        if (stockDakaEl) stockDakaEl.textContent = String(Number(stockTotals.daka || 0));
+        if (stockTashEl) stockTashEl.textContent = String(Number(stockTotals.tash || 0));
     };
 
-    const renderTypedStock = () => {
-        typedStockCards.innerHTML = '';
-        (currentData.stockByType || []).forEach((item) => {
-            const card = document.createElement('div');
-            card.className = 'rounded-xl border border-slate-200 p-3 bg-white';
-            card.innerHTML = `<p class="text-xs text-slate-500">${escapeHtml(sizeLabel(item.cylinder_type))}</p>
-                <p class="text-lg font-semibold text-oxygenDeep">${escapeHtml(t.stockTotal)}: ${Number(item.total || 0).toFixed(2)} <span class="text-xs font-medium text-slate-500">(${escapeHtml(t.pressurePsi)} ${Number(item.total_pressure || 0).toFixed(2)})</span></p>
-                <p class="text-xs text-emerald-600">${escapeHtml(t.stockAvailable)}: ${Number(item.available || 0).toFixed(2)} <span class="font-medium text-emerald-700">(${escapeHtml(t.pressurePsi)} ${Number(item.available_pressure || 0).toFixed(2)})</span></p>`;
-            typedStockCards.appendChild(card);
-        });
-    };
+    const renderTypedStock = () => {};
 
     const renderSupplierOptions = () => {
         const html = [`<option value="">${escapeHtml(t.selectSupplier)}</option>`]
             .concat((currentData.supplierOptions || []).map((s) => `<option value="${Number(s.id)}">${escapeHtml(s.name)}</option>`));
-        purchaseSupplier.innerHTML = html.join('');
+        if (purchaseSupplier) purchaseSupplier.innerHTML = html.join('');
         const filterHtml = [`<option value="0">${escapeHtml(t.allSuppliers)}</option>`]
             .concat((currentData.supplierOptions || []).map((s) => `<option value="${Number(s.id)}">${escapeHtml(s.name)}</option>`));
-        supplierFilter.innerHTML = filterHtml.join('');
-        paymentSupplierFilter.innerHTML = filterHtml.join('');
+        if (supplierFilter) supplierFilter.innerHTML = filterHtml.join('');
+        if (paymentSupplierFilter) paymentSupplierFilter.innerHTML = filterHtml.join('');
+        updatePurchaseEmptyState();
         refreshSupplierContextUI();
     };
 
     const refreshSupplierContextUI = () => {
+        if (!purchaseSupplier) return;
         const sid = Number(purchaseSupplier.value || 0);
         const sentMap = currentData.totalSentBySupplier || {};
         const totalSent = Number(sentMap[String(sid)] ?? sentMap[sid] ?? 0);
@@ -1898,23 +1959,25 @@ $supplierJs = [
                 previousPendingLine.textContent = t.pendingSelect;
             } else {
                 const p = getPendingEntry(sid);
-                const sum = Number(p.total != null ? p.total : SIZES.reduce((a, sz) => a + Number(p[sz] || 0), 0));
+                const sum = pendingTotal(p);
+                const opening = openingPending(sid, editPurchaseRow);
                 supplierPendingBadge.textContent = `${t.bakeePrefix} ${sum}`;
-                supplierPendingBadge.title = `${t.bakeeTitleDetail}: ${t.sizeSmall} ${Number(p.Small || 0)}, ${t.sizeMedium} ${Number(p.Medium || 0)}, ${t.sizeLarge} ${Number(p.Large || 0)}. ${sum}.`;
-                const openParts = SIZES.map((sz) => `${sizeLabel(sz)}: ${openingPendingForSize(sid, sz, editPurchaseRow)}`).join('; ');
-                previousPendingLine.textContent = `${t.pendingIntro} — ${openParts}`;
+                supplierPendingBadge.title = `${t.bakeeTitleDetail} ${sum}.`;
+                previousPendingLine.textContent = `${t.pendingIntro} — ${opening}`;
             }
         }
         calcPurchase();
     };
 
     const renderSuppliers = () => {
-        if (!currentData.suppliers.length) {
+        if (!suppliersTbody) return;
+        const supplierRows = currentData.suppliers || [];
+        if (!supplierRows.length) {
             suppliersTbody.innerHTML = `<tr><td class="p-3 text-slate-500" colspan="7">${escapeHtml(t.noSuppliers)}</td></tr>`;
             return;
         }
-        suppliersTbody.innerHTML = currentData.suppliers.map((row) => {
-            const balance = Math.max(0, Number(row.purchases || 0) - Number(row.paid || 0));
+        suppliersTbody.innerHTML = supplierRows.map((row) => {
+            const balance = Number(row.outstanding ?? Math.max(0, Number(row.opening_balance || 0) + Number(row.purchases || 0) - Number(row.paid || 0)));
             return `<tr class="border-t border-slate-100 fade-in">
                 <td class="p-3">${escapeHtml(row.name)}</td>
                 <td class="p-3">${escapeHtml(row.contact_person || '-')}</td>
@@ -1924,7 +1987,7 @@ $supplierJs = [
                 <td class="p-3 ${balance > 0 ? 'text-amber-600 font-semibold' : 'text-emerald-600'}">${fmt(balance)}</td>
                 <td class="p-3">
                     <div class="flex flex-wrap gap-2">
-                        <a class="btn btn-soft" href="?module=ledger&supplier_q=${encodeURIComponent(String(row.name || ''))}<?= i18n_lang_query() ?>">${escapeHtml(t.viewLedger)}</a>
+                        <a class="btn btn-soft" href="?module=suppliers&action=view_ledger&id=${Number(row.id)}<?= i18n_lang_query() ?>">${escapeHtml(t.viewLedger)}</a>
                         <button type="button" class="btn btn-soft supplier-delete-btn" data-id="${Number(row.id)}">${escapeHtml(t.delete)}</button>
                     </div>
                 </td>
@@ -1933,14 +1996,15 @@ $supplierJs = [
     };
 
     const renderPurchases = () => {
-        if (!currentData.purchases.length) {
-            purchaseTbody.innerHTML = `<tr><td class="p-3 text-slate-500" colspan="11">${escapeHtml(t.noPurchases)}</td></tr>`;
+        if (!purchaseTbody) return;
+        const purchaseRows = currentData.purchases || [];
+        if (!purchaseRows.length) {
+            purchaseTbody.innerHTML = `<tr><td class="p-3 text-slate-500" colspan="10">${escapeHtml(t.noPurchases)}</td></tr>`;
             return;
         }
-        purchaseTbody.innerHTML = currentData.purchases.map((row) => `<tr class="border-t border-slate-100 fade-in">
+        purchaseTbody.innerHTML = purchaseRows.map((row) => `<tr class="border-t border-slate-100 fade-in">
             <td class="p-3">${escapeHtml(row.transaction_date)}</td>
             <td class="p-3">${escapeHtml(row.supplier_name)}</td>
-            <td class="p-3">${escapeHtml(sizeLabel(row.cylinder_type))}</td>
             <td class="p-3">${Number(row.sent_quantity || 0)}</td>
             <td class="p-3">${Number(row.total_received || row.quantity || 0)}</td>
             <td class="p-3">${Number(row.inventory_quantity || row.quantity || 0).toFixed(2)}</td>
@@ -1960,8 +2024,11 @@ $supplierJs = [
 
     const renderPaymentHistory = () => {
         const rows = currentData.paymentHistory || [];
-        document.getElementById('periodPaidAmount').textContent = fmt((currentData.paymentSummary || {}).paid || 0);
-        document.getElementById('periodOutstandingAmount').textContent = fmt((currentData.paymentSummary || {}).outstanding || 0);
+        const periodPaidEl = document.getElementById('periodPaidAmount');
+        const periodOutstandingEl = document.getElementById('periodOutstandingAmount');
+        if (periodPaidEl) periodPaidEl.textContent = fmt((currentData.paymentSummary || {}).paid || 0);
+        if (periodOutstandingEl) periodOutstandingEl.textContent = fmt((currentData.paymentSummary || {}).outstanding || 0);
+        if (!paymentHistoryBody) return;
         if (!rows.length) {
             paymentHistoryBody.innerHTML = `<tr><td class="p-3 text-slate-500" colspan="8">${escapeHtml(t.noPayments)}</td></tr>`;
             return;
@@ -1989,47 +2056,34 @@ $supplierJs = [
 
     const syncHiddenCylinderType = () => {
         const el = document.getElementById('purchaseCylinderTypeHidden');
-        if (!el) return;
-        const s = Number(purchaseForm.sent_qty_Small?.value || 0);
-        const m = Number(purchaseForm.sent_qty_Medium?.value || 0);
-        const l = Number(purchaseForm.sent_qty_Large?.value || 0);
-        const nz = [];
-        if (s > 0) nz.push('Small');
-        if (m > 0) nz.push('Medium');
-        if (l > 0) nz.push('Large');
-        if (nz.length === 1) el.value = nz[0];
-        else if (nz.length > 1) el.value = 'Mixed';
-        else el.value = 'Small';
+        if (el) el.value = STANDARD_SIZE;
     };
 
     const resetDispatchRows = () => {
-        SIZES.forEach((sz) => {
-            const q = purchaseForm[`sent_qty_${sz}`];
-            const pr = purchaseForm[`sent_pressure_${sz}`];
-            if (q) q.value = '0';
-            if (pr) pr.value = '';
-        });
+        if (!purchaseForm) return;
+        const sentField = purchaseForm.elements.sent_qty || purchaseForm.sent_qty;
+        if (sentField) sentField.value = '0';
         syncHiddenCylinderType();
     };
 
     const resetRecvRows = () => {
-        SIZES.forEach((sz) => {
-            const q = purchaseForm[`recv_qty_${sz}`];
-            const pr = purchaseForm[`recv_pressure_${sz}`];
-            const u = purchaseForm[`recv_unit_price_${sz}`];
-            if (q) q.value = '0';
-            if (pr) pr.value = '';
-            if (u) u.value = '';
-        });
+        if (!purchaseForm) return;
+        const qtyField = purchaseForm.elements.recv_qty || purchaseForm.recv_qty;
+        const priceField = purchaseForm.elements.recv_total_price || purchaseForm.recv_total_price;
+        if (qtyField) qtyField.value = '';
+        if (priceField) priceField.value = '';
     };
 
     const renderAll = () => {
-        renderSummary();
-        renderTypedStock();
-        renderSupplierOptions();
-        renderSuppliers();
-        renderPurchases();
-        renderPaymentHistory();
+        try {
+            renderSummary();
+            renderSupplierOptions();
+            renderSuppliers();
+            renderPurchases();
+            renderPaymentHistory();
+        } catch (err) {
+            console.error('Suppliers UI render failed', err);
+        }
     };
 
     const buildRemainingByPayment = (historyRows, paymentRows) => {
@@ -2074,42 +2128,56 @@ $supplierJs = [
             return;
         }
         historyModal.dataset.supplierId = String(supplierId || 0);
-        const purchaseBody = document.getElementById('historyPurchaseBody');
-        const ledgerBody = document.getElementById('historyLedgerBody');
+        const billsList = document.getElementById('historyBillsList');
         const paymentBody = document.getElementById('historyPaymentBody');
         const historyRows = result.history || [];
         const paymentRows = result.payments || [];
         const remainingByPaymentId = buildRemainingByPayment(historyRows, paymentRows);
-        const pb = result.pendingBakee || { Small: 0, Medium: 0, Large: 0, total: 0 };
-        const pendingLine = t.dueRemainingTpl
-            .replace(/\{s\}/g, String(Number(pb.Small || 0)))
-            .replace(/\{m\}/g, String(Number(pb.Medium || 0)))
-            .replace(/\{l\}/g, String(Number(pb.Large || 0)))
+        const pb = result.pendingBakee || { total: 0 };
+        const pendingLine = (t.dueRemainingTpl || '')
             .replace(/\{t\}/g, String(Number(pb.total || 0)));
         const pendingEl = document.getElementById('historyPendingBakeeBody');
         if (pendingEl) pendingEl.innerHTML = pendingLine;
-        const pendingCompact = `S:${Number(pb.Small || 0)} M:${Number(pb.Medium || 0)} L:${Number(pb.Large || 0)}`;
-        purchaseBody.innerHTML = historyRows.length ? historyRows.map((row) => `<tr class="border-t border-slate-100">
-            <td class="p-2 whitespace-nowrap align-top">${escapeHtml(row.transaction_date)}</td>
-            <td class="p-2 align-top text-xs text-slate-800">${formatHistoryBreakdownCell(row.display_size_breakdown)}</td>
-            <td class="p-2 align-top text-xs whitespace-nowrap">${escapeHtml(row.display_sent_pressure || '—')}</td>
-            <td class="p-2 align-top text-xs whitespace-nowrap">${escapeHtml(row.display_recv_pressure || '—')}</td>
-            <td class="p-2 align-top text-xs whitespace-nowrap">${escapeHtml(row.display_unit_price || fmtRs(row.unit_price || 0))}</td>
-            <td class="p-2 text-right align-top whitespace-nowrap font-medium">${fmtRs(row.total_amount)}</td>
-            <td class="p-2 align-top"><span class="px-2 py-1 rounded-full text-xs ${statusClass(row.payment_status)}">${escapeHtml(mapPayStatus(row.payment_status))}</span></td>
-        </tr>`).join('') : `<tr><td class="p-2 text-slate-500" colspan="7">${escapeHtml(t.noPurchaseHistory)}</td></tr>`;
-        ledgerBody.innerHTML = (result.ledger || []).length ? result.ledger.map((row) => {
-            const desc = row.description || row.reference_type || t.entryFallback;
-            return `<tr class="border-t border-slate-100">
-            <td class="p-2 whitespace-nowrap align-top">${escapeHtml(row.entry_date)}</td>
-            <td class="p-2 align-top text-xs text-slate-800 max-w-[340px]"><span title="${escapeHtml(desc)}">${escapeHtml(desc)}</span></td>
-            <td class="p-2 align-top text-xs text-amber-900/90 whitespace-nowrap" title="${escapeHtml(t.ledgerPendingTitle)}">${escapeHtml(pendingCompact)}</td>
-            <td class="p-2 text-right align-top whitespace-nowrap font-medium">${fmtRs(row.debit)}</td>
-            <td class="p-2 text-right align-top whitespace-nowrap font-medium">${fmtRs(row.credit)}</td>
-            <td class="p-2 text-right align-top whitespace-nowrap font-semibold text-slate-900">${fmtRs(row.balance)}</td>
-        </tr>`;
-        }).join('') : `<tr><td class="p-2 text-slate-500" colspan="6">${escapeHtml(t.noLedger)}</td></tr>`;
-        paymentBody.innerHTML = paymentRows.length ? paymentRows.map((row) => `<tr class="border-t border-slate-100">
+        const billStatusLabel = (row) => {
+            const rem = Number(row.remaining_amount || 0);
+            const paid = Number(row.paid_amount || 0);
+            if (rem <= 0.00001) return t.statusPaid;
+            if (paid > 0) return t.statusPartial;
+            return t.statusDue;
+        };
+        const renderBillCard = (row) => {
+            const txId = Number(row.id || 0);
+            const notes = String(row.display_notes || row.notes || '').trim();
+            const recvQty = Number(row.received_qty ?? row.total_received ?? row.quantity ?? 0);
+            const payType = escapeHtml(row.display_payment_type || row.payment_type || '—');
+            const statusLbl = billStatusLabel(row);
+            const notesBlock = notes
+                ? `<p class="mt-3 text-sm text-slate-700 border-t border-slate-100 pt-2"><span class="text-slate-500 text-xs block mb-0.5">${escapeHtml(t.colDescription)}</span>${escapeHtml(notes)}</p>`
+                : '';
+            return `<article class="rounded-xl border border-slate-200 bg-white p-3 sm:p-4 shadow-sm">
+                <div class="flex flex-wrap items-start justify-between gap-2 mb-3">
+                    <div>
+                        <h5 class="font-semibold text-oxygenDeep">SP-${txId}</h5>
+                        <p class="text-xs text-slate-500">${escapeHtml(row.transaction_date || '')}</p>
+                    </div>
+                    <span class="px-2 py-1 rounded-full text-xs ${statusClass(row.payment_status)}">${escapeHtml(statusLbl)}</span>
+                </div>
+                <dl class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-x-3 gap-y-2 text-sm">
+                    <div><dt class="text-slate-500 text-xs">${escapeHtml(t.colReceivedQty)}</dt><dd class="font-medium tabular-nums">${recvQty}</dd></div>
+                    <div><dt class="text-slate-500 text-xs">${escapeHtml(t.colBillTotal)}</dt><dd class="font-medium tabular-nums">${escapeHtml(row.display_total_price || fmtRs(row.total_amount || 0))}</dd></div>
+                    <div><dt class="text-slate-500 text-xs">${escapeHtml(t.colPaid)}</dt><dd class="font-medium tabular-nums">${fmtRs(row.paid_amount || 0)}</dd></div>
+                    <div><dt class="text-slate-500 text-xs">${escapeHtml(t.colRemaining)}</dt><dd class="font-medium tabular-nums ${Number(row.remaining_amount || 0) > 0 ? 'text-amber-600' : 'text-emerald-600'}">${fmtRs(row.remaining_amount || 0)}</dd></div>
+                    <div class="col-span-2 sm:col-span-1"><dt class="text-slate-500 text-xs">${escapeHtml(t.colPaymentType)}</dt><dd class="font-medium">${payType}</dd></div>
+                </dl>
+                ${notesBlock}
+            </article>`;
+        };
+        if (billsList) {
+            billsList.innerHTML = historyRows.length
+                ? historyRows.map(renderBillCard).join('')
+                : `<p class="text-sm text-slate-500 py-4 text-center">${escapeHtml(t.noBills)}</p>`;
+        }
+        if (paymentBody) paymentBody.innerHTML = paymentRows.length ? paymentRows.map((row) => `<tr class="border-t border-slate-100">
             <td class="p-2">${escapeHtml(row.payment_date || '-')}</td>
             <td class="p-2">SP-${Number(row.transaction_id || 0)}</td>
             <td class="p-2 text-right font-medium">${fmtRs(row.amount)}</td>
@@ -2126,141 +2194,192 @@ $supplierJs = [
                 </div>
             </td>
         </tr>`).join('') : `<tr><td class="p-2 text-slate-500" colspan="5">${escapeHtml(t.noInstallmentPayments)}</td></tr>`;
+        if (!ledgerPaymentForm || !historyModal) return;
         const duePurchases = historyRows.filter((row) => Number(row.remaining_amount || 0) > 0);
         const txOptions = [`<option value="">${escapeHtml(t.selectPurchase)}</option>`].concat(
             duePurchases.map((row) => `<option value="${Number(row.id)}">SP-${Number(row.id)} | ${escapeHtml(row.transaction_date)} | ${escapeHtml(t.lblDue)}: ${fmtRs(row.total_amount)} · ${escapeHtml(t.lblRem)}: ${fmtRs(row.remaining_amount)}</option>`),
         );
-        ledgerPaymentForm.transaction_id.innerHTML = txOptions.join('');
-        ledgerPaymentForm.payment_id.value = '';
-        ledgerPaymentForm.supplier_id.value = String(supplierId || 0);
-        ledgerPaymentForm.payment_date.value = '<?= date('Y-m-d') ?>';
-        ledgerPaymentForm.amount.value = '';
-        ledgerPaymentForm.payment_type.value = 'Cash';
-        ledgerPaymentSubmitBtn.textContent = t.savePayment;
-        ledgerPaymentResetBtn.classList.add('hidden');
+        if (ledgerPaymentForm.transaction_id) ledgerPaymentForm.transaction_id.innerHTML = txOptions.join('');
+        if (ledgerPaymentForm.payment_id) ledgerPaymentForm.payment_id.value = '';
+        if (ledgerPaymentForm.supplier_id) ledgerPaymentForm.supplier_id.value = String(supplierId || 0);
+        if (ledgerPaymentForm.payment_date) ledgerPaymentForm.payment_date.value = '<?= date('Y-m-d') ?>';
+        if (ledgerPaymentForm.amount) ledgerPaymentForm.amount.value = '';
+        if (ledgerPaymentForm.payment_type) ledgerPaymentForm.payment_type.value = 'Cash';
+        if (ledgerPaymentSubmitBtn) ledgerPaymentSubmitBtn.textContent = t.savePayment;
+        if (ledgerPaymentResetBtn) ledgerPaymentResetBtn.classList.add('hidden');
         historyModal.classList.remove('hidden');
         historyModal.classList.add('flex');
     };
 
     const calcPurchase = () => {
+        if (!purchaseForm || !purchaseSupplier) return;
         syncHiddenCylinderType();
         const sid = Number(purchaseSupplier.value || 0);
-        const sentBy = {
-            Small: Number(purchaseForm.sent_qty_Small?.value || 0),
-            Medium: Number(purchaseForm.sent_qty_Medium?.value || 0),
-            Large: Number(purchaseForm.sent_qty_Large?.value || 0),
-        };
-        SIZES.forEach((sz) => {
-            const subEl = document.getElementById(`dispatchSub${sz}`);
-            if (subEl) subEl.textContent = String(sentBy[sz] || 0);
-        });
-        const grand = sentBy.Small + sentBy.Medium + sentBy.Large;
-        const dg = document.getElementById('dispatchSentGrand');
-        if (dg) dg.textContent = String(grand);
-        const defaultUnit = Number(purchaseForm.unit_price?.value || 0);
-        const paid = Number(purchaseForm.paid_amount?.value || 0);
-        let inventoryFromRows = 0;
-        let total = 0;
-        SIZES.forEach((sz) => {
-            const qtyEl = purchaseForm[`recv_qty_${sz}`];
-            const unitEl = purchaseForm[`recv_unit_price_${sz}`];
-            const qty = qtyEl ? Number(qtyEl.value || 0) : 0;
-            let lineUnit = unitEl ? Number(unitEl.value || 0) : 0;
-            if (!lineUnit || lineUnit < 0) lineUnit = defaultUnit;
-            inventoryFromRows += qty;
-            total += qty * lineUnit;
-            const pendIn = openingPendingForSize(sid, sz, editPurchaseRow);
-            const sentHere = Number(sentBy[sz] || 0);
-            const recv = qty;
-            const pendingAfter = pendIn + sentHere - recv;
-            const pendField = refillBreakdownBody.querySelector(`.recv-pending[data-size="${sz}"]`);
-            if (pendField) pendField.value = String(Math.max(0, pendingAfter));
-            const lineSpan = refillBreakdownBody.querySelector(`.recv-line-total[data-size="${sz}"]`);
-            if (lineSpan) lineSpan.textContent = fmt(qty * lineUnit);
-        });
+        const sentHere = Number((purchaseForm.elements.sent_qty || purchaseForm.sent_qty)?.value || 0);
+        const paid = Number((purchaseForm.elements.paid_amount || purchaseForm.paid_amount)?.value || 0);
+        const qty = Number((purchaseForm.elements.recv_qty || purchaseForm.recv_qty)?.value || 0);
+        const total = Math.max(0, Number((purchaseForm.elements.recv_total_price || purchaseForm.recv_total_price)?.value || 0));
+        const pendIn = openingPending(sid, editPurchaseRow);
+        const pendingAfter = pendIn + sentHere - qty;
+        const pendField = document.getElementById('recvPending');
+        if (pendField) pendField.value = String(Math.max(0, pendingAfter));
+        const lineSpan = document.getElementById('recvLineTotal');
+        if (lineSpan) lineSpan.textContent = fmt(total);
         const trEl = document.getElementById('purchaseTotalReceived');
-        if (trEl) trEl.value = String(Math.max(0, Math.round(inventoryFromRows)));
+        if (trEl) trEl.value = String(Math.max(0, Math.round(qty)));
         if (purchaseForm.inventory_qty_preview) {
-            purchaseForm.inventory_qty_preview.value = inventoryFromRows > 0 ? Number(inventoryFromRows).toFixed(2) : '0.00';
+            purchaseForm.inventory_qty_preview.value = qty > 0 ? String(Math.round(qty)) : '0';
         }
         const remaining = Math.max(0, total - paid);
         if (purchaseForm.total_amount_preview) purchaseForm.total_amount_preview.value = total > 0 ? fmt(total) : '';
         if (purchaseForm.remaining_amount_preview) purchaseForm.remaining_amount_preview.value = total > 0 ? fmt(remaining) : '';
     };
 
-    ['unit_price', 'paid_amount'].forEach((name) => {
-        const field = purchaseForm[name];
-        if (!field) return;
-        field.addEventListener('input', calcPurchase);
-    });
-    SIZES.forEach((sz) => {
-        ['recv_qty_', 'recv_pressure_', 'recv_unit_price_', 'sent_qty_', 'sent_pressure_'].forEach((prefix) => {
-            const field = purchaseForm[`${prefix}${sz}`];
-            if (field) field.addEventListener('input', calcPurchase);
+    if (purchaseForm) {
+        ['paid_amount', 'sent_qty', 'recv_qty', 'recv_total_price'].forEach((name) => {
+            const field = purchaseForm.elements[name] || purchaseForm[name];
+            if (!field) return;
+            field.addEventListener('input', calcPurchase);
+        });
+        purchaseForm.addEventListener('submit', (event) => {
+            event.preventDefault();
+            savePurchase();
+        });
+    }
+    if (purchaseSubmitBtn) {
+        purchaseSubmitBtn.addEventListener('click', (event) => {
+            event.preventDefault();
+            savePurchase();
+        });
+    }
+    if (purchaseSupplier) {
+        purchaseSupplier.addEventListener('change', refreshSupplierContextUI);
+    }
+
+    const standardStockCounts = () => {
+        const totals = currentData.stockTotals || {};
+        return {
+            daka: Number(totals.daka ?? 0),
+            tash: Number(totals.tash ?? 0),
+        };
+    };
+
+    const refreshStockCurrentLine = () => {
+        const lineEl = document.getElementById('stockCurrentLine');
+        if (!lineEl) return;
+        const row = standardStockCounts();
+        lineEl.textContent = (t.stockCurrentLine || '')
+            .replace(/\{daka\}/g, String(row.daka))
+            .replace(/\{tash\}/g, String(row.tash));
+    };
+
+    const syncStockFormPrefill = () => {
+        const modeEl = document.getElementById('stockModeSelect');
+        const dakaIn = document.getElementById('stockDakaInput');
+        const tashIn = document.getElementById('stockTashInput');
+        if (!modeEl || modeEl.value !== 'set') return;
+        const row = standardStockCounts();
+        if (dakaIn) dakaIn.value = String(row.daka);
+        if (tashIn) tashIn.value = String(row.tash);
+    };
+
+    const stockSetupForm = document.getElementById('stockSetupForm');
+    const stockModeSelect = document.getElementById('stockModeSelect');
+    if (stockModeSelect) {
+        stockModeSelect.addEventListener('change', () => {
+            if (stockModeSelect.value === 'set') {
+                syncStockFormPrefill();
+            }
+        });
+    }
+    document.querySelectorAll('[data-open-modal="stockSetupModal"]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+            refreshStockCurrentLine();
+            syncStockFormPrefill();
         });
     });
-    purchaseSupplier.addEventListener('change', refreshSupplierContextUI);
+    if (stockSetupForm) {
+        stockSetupForm.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            const dakaQty = Number(stockSetupForm.elements.daka_qty?.value || 0);
+            const tashQty = Number(stockSetupForm.elements.tash_qty?.value || 0);
+            if (dakaQty <= 0 && tashQty <= 0) {
+                showToast(t.errStockQty);
+                return;
+            }
+            const submitBtn = document.getElementById('stockSetupSubmitBtn');
+            if (submitBtn) submitBtn.disabled = true;
+            const result = await request(new FormData(stockSetupForm));
+            if (submitBtn) submitBtn.disabled = false;
+            showToast(result.message || t.saved);
+            if (!result.ok) return;
+            currentData = result.data;
+            renderAll();
+            refreshStockCurrentLine();
+            const modal = document.getElementById('stockSetupModal');
+            if (modal) {
+                modal.classList.add('hidden');
+                modal.classList.remove('flex');
+            }
+            if (stockModeSelect?.value === 'set') {
+                syncStockFormPrefill();
+            } else if (stockSetupForm.elements.daka_qty) {
+                stockSetupForm.elements.daka_qty.value = '';
+                if (stockSetupForm.elements.tash_qty) stockSetupForm.elements.tash_qty.value = '';
+            }
+        });
+    }
 
-    supplierForm.addEventListener('submit', async (event) => {
-        event.preventDefault();
-        const result = await request(new FormData(supplierForm));
-        showToast(result.message || t.saved);
-        if (!result.ok) return;
-        supplierForm.reset();
-        currentData = result.data;
-        renderAll();
-    });
+    if (supplierForm) {
+        supplierForm.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            const result = await request(new FormData(supplierForm));
+            showToast(result.message || t.saved);
+            if (!result.ok) return;
+            supplierForm.reset();
+            currentData = result.data;
+            renderAll();
+            const opts = currentData.supplierOptions || [];
+            if (purchaseSupplier && opts.length > 0) {
+                purchaseSupplier.value = String(opts[opts.length - 1].id);
+            }
+            showPurchaseAlert('');
+            refreshSupplierContextUI();
+        });
+    }
 
-    purchaseForm.addEventListener('submit', async (event) => {
-        event.preventDefault();
-        calcPurchase();
-        const result = await request(new FormData(purchaseForm));
-        showToast(result.message || t.saved);
-        if (!result.ok) return;
-        editPurchaseRow = null;
-        purchaseForm.reset();
-        purchaseForm.action.value = 'record_purchase';
-        purchaseForm.purchase_id.value = '';
-        purchaseSubmitBtn.textContent = t.saveReceipt;
-        purchaseResetBtn.classList.add('hidden');
-        purchaseForm.transaction_date.value = '<?= date('Y-m-d') ?>';
-        purchaseForm.date_sent.value = '<?= date('Y-m-d') ?>';
-        resetDispatchRows();
-        resetRecvRows();
-        const trEl = document.getElementById('purchaseTotalReceived');
-        if (trEl) trEl.value = '0';
-        calcPurchase();
-        currentData = result.data;
-        renderAll();
-        refreshSupplierContextUI();
-    });
+    if (purchaseResetBtn && purchaseForm) {
+        purchaseResetBtn.addEventListener('click', () => {
+            editPurchaseRow = null;
+            purchaseForm.reset();
+            setPurchaseAction('record_purchase');
+            const purchaseIdField = purchaseForm.elements.purchase_id || purchaseForm.purchase_id;
+            if (purchaseIdField) purchaseIdField.value = '';
+            if (purchaseSubmitBtn) purchaseSubmitBtn.textContent = t.saveReceipt;
+            purchaseResetBtn.classList.add('hidden');
+            const txDate = purchaseForm.elements.transaction_date || purchaseForm.transaction_date;
+            const sentDate = purchaseForm.elements.date_sent || purchaseForm.date_sent;
+            if (txDate) txDate.value = '<?= date('Y-m-d') ?>';
+            if (sentDate) sentDate.value = '<?= date('Y-m-d') ?>';
+            resetDispatchRows();
+            resetRecvRows();
+            const trEl = document.getElementById('purchaseTotalReceived');
+            if (trEl) trEl.value = '0';
+            calcPurchase();
+            refreshSupplierContextUI();
+        });
+    }
 
-    purchaseResetBtn.addEventListener('click', () => {
-        editPurchaseRow = null;
-        purchaseForm.reset();
-        purchaseForm.action.value = 'record_purchase';
-        purchaseForm.purchase_id.value = '';
-        purchaseSubmitBtn.textContent = t.saveReceipt;
-        purchaseResetBtn.classList.add('hidden');
-        purchaseForm.transaction_date.value = '<?= date('Y-m-d') ?>';
-        purchaseForm.date_sent.value = '<?= date('Y-m-d') ?>';
-        resetDispatchRows();
-        resetRecvRows();
-        const trEl = document.getElementById('purchaseTotalReceived');
-        if (trEl) trEl.value = '0';
-        calcPurchase();
-        refreshSupplierContextUI();
-    });
-
-    document.getElementById('applyFilterBtn').addEventListener('click', async () => {
+    const applyFilterBtn = document.getElementById('applyFilterBtn');
+    if (applyFilterBtn) applyFilterBtn.addEventListener('click', async () => {
         const body = new FormData();
         body.append('action', 'fetch_dashboard');
         body.append('search', document.getElementById('supplierSearch').value || '');
         body.append('from_date', document.getElementById('filterFromDate').value || '');
         body.append('to_date', document.getElementById('filterToDate').value || '');
-        body.append('supplier_filter', supplierFilter.value || '0');
-        body.append('payment_period', paymentPeriodFilter.value || 'weekly');
-        body.append('payment_supplier_filter', paymentSupplierFilter.value || '0');
+        body.append('supplier_filter', supplierFilter?.value || '0');
+        body.append('payment_period', paymentPeriodFilter?.value || 'weekly');
+        body.append('payment_supplier_filter', paymentSupplierFilter?.value || '0');
         const result = await request(body);
         if (!result.ok) {
             showToast(result.message || t.filterFailed);
@@ -2270,11 +2389,12 @@ $supplierJs = [
         renderAll();
     });
 
-    document.getElementById('applyPaymentFilterBtn').addEventListener('click', async () => {
+    const applyPaymentFilterBtn = document.getElementById('applyPaymentFilterBtn');
+    if (applyPaymentFilterBtn) applyPaymentFilterBtn.addEventListener('click', async () => {
         const body = new FormData();
         body.append('action', 'fetch_payment_history');
-        body.append('payment_period', paymentPeriodFilter.value || 'weekly');
-        body.append('payment_supplier_filter', paymentSupplierFilter.value || '0');
+        body.append('payment_period', paymentPeriodFilter?.value || 'weekly');
+        body.append('payment_supplier_filter', paymentSupplierFilter?.value || '0');
         const result = await request(body);
         if (!result.ok) {
             showToast(result.message || t.paymentHistoryFailed);
@@ -2285,13 +2405,14 @@ $supplierJs = [
         renderPaymentHistory();
     });
 
-    document.getElementById('exportCsvBtn').addEventListener('click', () => {
+    const exportCsvBtn = document.getElementById('exportCsvBtn');
+    if (exportCsvBtn) exportCsvBtn.addEventListener('click', () => {
         const params = new URLSearchParams({
             module: 'suppliers',
             action: 'export_purchases_csv',
             from_date: document.getElementById('filterFromDate').value || '',
             to_date: document.getElementById('filterToDate').value || '',
-            supplier_filter: supplierFilter.value || '0'
+            supplier_filter: supplierFilter?.value || '0'
         });
         const qs = params.toString() + <?= json_encode(i18n_locale() === 'ps' ? '&lang=ps' : '', JSON_UNESCAPED_UNICODE) ?>;
         window.open(`?${qs}`, '_blank');
@@ -2300,44 +2421,31 @@ $supplierJs = [
     document.addEventListener('click', async (event) => {
         const target = event.target;
         if (!(target instanceof HTMLElement)) return;
-        if (target.classList.contains('purchase-edit-btn')) {
+        if (target.classList.contains('purchase-edit-btn') && purchaseForm) {
             const payload = target.getAttribute('data-purchase') || '{}';
             const row = JSON.parse(payload);
             editPurchaseRow = row;
-            purchaseForm.action.value = 'update_purchase';
-            purchaseForm.purchase_id.value = String(row.id || '');
-            purchaseForm.supplier_id.value = String(row.supplier_id || '');
-            const sents = parseSentFromPurchaseRow(row);
-            const pressKeys = { Small: 'sent_pressure_small', Medium: 'sent_pressure_medium', Large: 'sent_pressure_large' };
-            SIZES.forEach((sz) => {
-                const q = purchaseForm[`sent_qty_${sz}`];
-                const pr = purchaseForm[`sent_pressure_${sz}`];
-                if (q) q.value = String(sents[sz] ?? 0);
-                if (pr) {
-                    const pk = pressKeys[sz];
-                    const pv = row[pk];
-                    pr.value = pv != null && pv !== '' ? String(pv) : '';
-                }
-            });
+            setPurchaseAction('update_purchase');
+            const purchaseIdEl = purchaseForm.elements.purchase_id || purchaseForm.purchase_id;
+            const supplierIdEl = purchaseForm.elements.supplier_id || purchaseForm.supplier_id;
+            if (purchaseIdEl) purchaseIdEl.value = String(row.id || '');
+            if (supplierIdEl) supplierIdEl.value = String(row.supplier_id || '');
+            if (purchaseForm.sent_qty) purchaseForm.sent_qty.value = String(parseSentQtyFromPurchaseRow(row));
             syncHiddenCylinderType();
             purchaseForm.date_sent.value = row.date_sent || '<?= date('Y-m-d') ?>';
-            purchaseForm.unit_price.value = String(row.unit_price || 0);
             purchaseForm.transaction_date.value = row.transaction_date || '<?= date('Y-m-d') ?>';
             purchaseForm.paid_amount.value = String(row.paid_amount || 0);
             purchaseForm.payment_type.value = row.payment_type || 'Credit';
+            if (purchaseForm.transaction_notes) {
+                purchaseForm.transaction_notes.value = String(row.notes || row.display_notes || '').trim();
+            }
             const parsed = parseBreakdownForForm(row);
-            SIZES.forEach((sz) => {
-                const q = purchaseForm[`recv_qty_${sz}`];
-                const pr = purchaseForm[`recv_pressure_${sz}`];
-                const u = purchaseForm[`recv_unit_price_${sz}`];
-                if (q) q.value = String(parsed.qty[sz] ?? 0);
-                if (pr) pr.value = parsed.pressure[sz] || '';
-                if (u) u.value = parsed.unit[sz] || '';
-            });
+            if (purchaseForm.recv_qty) purchaseForm.recv_qty.value = String(parsed.qty);
+            if (purchaseForm.recv_total_price) purchaseForm.recv_total_price.value = String(parsed.total > 0 ? parsed.total : (row.total_amount || 0));
             const trEl = document.getElementById('purchaseTotalReceived');
             if (trEl) trEl.value = String(row.total_received || row.quantity || 0);
-            purchaseSubmitBtn.textContent = t.updateReceipt;
-            purchaseResetBtn.classList.remove('hidden');
+            if (purchaseSubmitBtn) purchaseSubmitBtn.textContent = t.updateReceipt;
+            if (purchaseResetBtn) purchaseResetBtn.classList.remove('hidden');
             refreshSupplierContextUI();
             calcPurchase();
             purchaseForm.scrollIntoView({ behavior: 'smooth', block: 'center' });
@@ -2352,6 +2460,9 @@ $supplierJs = [
             if (!result.ok) return;
             currentData = result.data;
             renderAll();
+            if (window.OxygenFinance?.notify) {
+                window.OxygenFinance.notify({ source: 'supplier_purchase' });
+            }
         }
         if (target.classList.contains('supplier-delete-btn')) {
             if (!confirm(t.confirmDelSupplier)) return;
@@ -2364,10 +2475,11 @@ $supplierJs = [
             currentData = result.data;
             renderAll();
         }
-        if (target.classList.contains('history-payment-edit-btn')) {
-            ledgerPaymentForm.payment_id.value = target.dataset.id || '';
+        if (target.classList.contains('history-payment-edit-btn') && ledgerPaymentForm) {
+            if (ledgerPaymentForm.payment_id) ledgerPaymentForm.payment_id.value = target.dataset.id || '';
             const editTxId = Number(target.dataset.transactionId || 0);
             const txSelect = ledgerPaymentForm.transaction_id;
+            if (!txSelect) return;
             if (editTxId > 0) {
                 const hasOpt = [...txSelect.options].some((o) => Number(o.value) === editTxId);
                 if (!hasOpt) {
@@ -2380,11 +2492,11 @@ $supplierJs = [
             } else {
                 ledgerPaymentForm.transaction_id.value = '';
             }
-            ledgerPaymentForm.payment_date.value = target.dataset.date || '<?= date('Y-m-d') ?>';
-            ledgerPaymentForm.amount.value = String(target.dataset.amount || '');
-            ledgerPaymentForm.payment_type.value = target.dataset.paymentType || 'Cash';
-            ledgerPaymentSubmitBtn.textContent = t.updatePayment;
-            ledgerPaymentResetBtn.classList.remove('hidden');
+            if (ledgerPaymentForm.payment_date) ledgerPaymentForm.payment_date.value = target.dataset.date || '<?= date('Y-m-d') ?>';
+            if (ledgerPaymentForm.amount) ledgerPaymentForm.amount.value = String(target.dataset.amount || '');
+            if (ledgerPaymentForm.payment_type) ledgerPaymentForm.payment_type.value = target.dataset.paymentType || 'Cash';
+            if (ledgerPaymentSubmitBtn) ledgerPaymentSubmitBtn.textContent = t.updatePayment;
+            if (ledgerPaymentResetBtn) ledgerPaymentResetBtn.classList.remove('hidden');
         }
         if (target.classList.contains('history-payment-delete-btn')) {
             if (!confirm(t.confirmDelPayment)) return;
@@ -2405,12 +2517,12 @@ $supplierJs = [
                 window.open(`?module=suppliers&action=print_purchase_invoice&purchase_id=${id}<?= i18n_locale() === 'ps' ? '&lang=ps' : '' ?>`, '_blank');
             }
         }
-        if (target.dataset.closeHistory === '1') {
+        if (target.dataset.closeHistory === '1' && historyModal) {
             historyModal.classList.add('hidden');
             historyModal.classList.remove('flex');
         }
     });
-    ledgerPaymentForm.addEventListener('submit', async (event) => {
+    if (ledgerPaymentForm) ledgerPaymentForm.addEventListener('submit', async (event) => {
         event.preventDefault();
         const supplierId = Number(ledgerPaymentForm.supplier_id.value || historyModal.dataset.supplierId || 0);
         if (supplierId <= 0) {
@@ -2422,15 +2534,18 @@ $supplierJs = [
         const result = await request(body);
         showToast(result.message || t.saved);
         if (!result.ok) return;
+        if (result.finance && window.OxygenFinance?.notify) {
+            window.OxygenFinance.notify({ source: 'supplier_payment' });
+        }
         await loadSupplierHistory(supplierId);
     });
 
-    ledgerPaymentResetBtn.addEventListener('click', () => {
-        ledgerPaymentForm.payment_id.value = '';
-        ledgerPaymentForm.payment_date.value = '<?= date('Y-m-d') ?>';
-        ledgerPaymentForm.amount.value = '';
-        ledgerPaymentForm.payment_type.value = 'Cash';
-        ledgerPaymentSubmitBtn.textContent = t.savePayment;
+    if (ledgerPaymentResetBtn && ledgerPaymentForm) ledgerPaymentResetBtn.addEventListener('click', () => {
+        if (ledgerPaymentForm.payment_id) ledgerPaymentForm.payment_id.value = '';
+        if (ledgerPaymentForm.payment_date) ledgerPaymentForm.payment_date.value = '<?= date('Y-m-d') ?>';
+        if (ledgerPaymentForm.amount) ledgerPaymentForm.amount.value = '';
+        if (ledgerPaymentForm.payment_type) ledgerPaymentForm.payment_type.value = 'Cash';
+        if (ledgerPaymentSubmitBtn) ledgerPaymentSubmitBtn.textContent = t.savePayment;
         ledgerPaymentResetBtn.classList.add('hidden');
     });
 
@@ -2440,6 +2555,23 @@ $supplierJs = [
     editPurchaseRow = null;
     calcPurchase();
     refreshSupplierContextUI();
+})();
+
+(() => {
+    const totalEl = document.getElementById('suppTotalReceived');
+    if (!totalEl || !window.OxygenFinance?.onUpdated) return;
+    window.OxygenFinance.onUpdated(async () => {
+        try {
+            const u = new URL(window.location.href);
+            u.searchParams.set('module', 'ledger');
+            u.searchParams.set('ajax', 'finance_pulse');
+            const res = await fetch(u.toString(), { headers: { 'X-Requested-With': 'XMLHttpRequest' } });
+            const data = await res.json();
+            if (data.ok && data.pulse?.total_received_all_time_formatted) {
+                totalEl.textContent = data.pulse.total_received_all_time_formatted;
+            }
+        } catch (_) { /* ignore */ }
+    });
 })();
 </script>
 <?php

@@ -14,16 +14,14 @@ $allowedModules = [
     'login',
     'logout',
     'dashboard',
+    'cash',
     'suppliers',
     'customers',
     'services',
+    'orders',
     'ledger',
     'reports',
-    'customer_reports',
-    'supplier_reports',
     'suppliers_list',
-    'supplier_purchases',
-    'supplier_payments',
     'settings',
 ];
 

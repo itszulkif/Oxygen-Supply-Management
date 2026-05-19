@@ -43,43 +43,36 @@ final class OxygenOpsService
             $totalSent = 0;
             $totalReceived = 0;
             $lineTotal = 0.0;
+            $runningCylinderSigned = $this->customerCylinderSignedNet($customerId);
             foreach ($rows as $row) {
-                $size = ucfirst(strtolower((string) ($row['size'] ?? '')));
-                if ($size === 'Jumbo') {
-                    $size = 'Large';
-                }
-                if (!in_array($size, ['Small', 'Medium', 'Large'], true)) {
-                    continue;
-                }
+                $size = normalize_cylinder_type((string) ($row['size'] ?? ''));
                 $sent = max(0, (int) ($row['sent'] ?? 0));
                 $received = max(0, (int) ($row['received'] ?? 0));
                 $rate = max(0, (float) ($row['rate'] ?? 0));
-                $salePressure = max(0, (float) ($row['sale_pressure'] ?? 0));
-                $pressureAdded = max(0, (float) ($row['pressure_added'] ?? 0));
                 $totalPrice = max(0, (float) ($row['total_price'] ?? 0));
-                $rowBasis = strtolower((string) ($row['billing_basis'] ?? $saleBasis));
-                if (!in_array($rowBasis, ['quantity', 'psi'], true)) {
-                    $rowBasis = $saleBasis;
-                }
+                $rowBasis = $saleBasis;
                 if ($sent <= 0 && $received <= 0) {
-                    if (!($rowBasis === 'psi' && $pressureAdded > 0)) {
+                    if (!($rowBasis === 'psi' && $totalPrice > 0)) {
                         continue;
                     }
                 }
                 $saleUnits = $sent > 0 ? $sent : $received;
                 if ($rowBasis === 'psi') {
-                    if ($pressureAdded <= 0) {
-                        throw new RuntimeException('Pressure added is required for PSI billing.');
+                    if ($totalPrice <= 0) {
+                        throw new RuntimeException('Total price is required for PSI billing.');
                     }
-                    $saleUnits = (int) round($pressureAdded);
+                    $saleUnits = 1;
                 }
-                $baqi = $sent - $received;
+                if ($rowBasis !== 'psi') {
+                    $runningCylinderSigned += ($received - $sent);
+                    $baqi = max(0, abs($runningCylinderSigned));
+                } else {
+                    $baqi = 0;
+                }
                 $rowAmount = $rowBasis === 'psi'
-                    ? ($totalPrice > 0 ? $totalPrice : max(0, $pressureAdded * $rate))
-                    : max(0, $saleUnits * $rate);
-                $soldPressureTotal = $rowBasis === 'psi'
-                    ? $pressureAdded
-                    : max(0, $saleUnits * $salePressure);
+                    ? $totalPrice
+                    : max(0, $totalPrice > 0 ? $totalPrice : $rate);
+                $soldPressureTotal = 0.0;
                 $normalizedRows[] = [
                     'size' => $size,
                     'sent' => $sent,
@@ -88,8 +81,8 @@ final class OxygenOpsService
                     'baqi' => $baqi,
                     'rate' => $rate,
                     'billing_basis' => $rowBasis,
-                    'sale_pressure' => $salePressure,
-                    'pressure_added' => $pressureAdded,
+                    'sale_pressure' => 0.0,
+                    'pressure_added' => 0.0,
                     'sold_pressure_total' => $soldPressureTotal,
                     'total' => $rowAmount,
                 ];
@@ -211,6 +204,136 @@ final class OxygenOpsService
         }
     }
 
+    /**
+     * Receive payment from customer: applies to oldest invoices first, then reduces opening / ledger receivable.
+     */
+    public function receiveCustomerPayment(array $data): array
+    {
+        $customerId = (int) ($data['customer_id'] ?? 0);
+        $amount = max(0, (float) ($data['amount'] ?? 0));
+        $paymentDate = (string) ($data['payment_date'] ?? date('Y-m-d'));
+        $note = trim((string) ($data['note'] ?? ''));
+        if ($customerId <= 0) {
+            throw new RuntimeException('Valid customer is required.');
+        }
+        if ($amount <= 0) {
+            throw new RuntimeException('Payment amount must be greater than zero.');
+        }
+
+        $receivable = customer_receivable_balance($this->pdo, $customerId);
+        if ($amount > $receivable + 0.00001) {
+            throw new RuntimeException('Payment exceeds customer receivable balance.');
+        }
+
+        $this->pdo->beginTransaction();
+        try {
+            $allocation = $this->applyPaymentAcrossOldestInvoices($customerId, $amount, $paymentDate);
+            $appliedToInvoices = (float) ($allocation['applied_total'] ?? 0);
+            $ledgerOnly = (float) ($allocation['unapplied_amount'] ?? 0);
+            $lastPaymentId = (int) ($allocation['last_payment_id'] ?? 0);
+
+            if ($appliedToInvoices > 0) {
+                $invoiceDesc = $note !== '' ? $note : 'Payment received (invoices)';
+                $this->upsertLedger(
+                    $customerId,
+                    0,
+                    $appliedToInvoices,
+                    $paymentDate,
+                    [
+                        'description' => $invoiceDesc,
+                        'sent' => 0,
+                        'received' => 0,
+                        'baqi' => 0,
+                        'reference_type' => 'payment',
+                        'reference_id' => $lastPaymentId,
+                    ]
+                );
+            }
+            if ($ledgerOnly > 0.00001) {
+                $openingDesc = $note !== '' ? $note : __('ledger.payment_opening_settlement');
+                $this->upsertLedger(
+                    $customerId,
+                    0,
+                    $ledgerOnly,
+                    $paymentDate,
+                    [
+                        'description' => $openingDesc,
+                        'sent' => 0,
+                        'received' => 0,
+                        'baqi' => 0,
+                        'reference_type' => 'opening_payment',
+                        'reference_id' => $customerId,
+                    ]
+                );
+            }
+
+            $this->pdo->commit();
+            return [
+                'applied_to_invoices' => $appliedToInvoices,
+                'applied_to_opening' => $ledgerOnly,
+                'payment_id' => $lastPaymentId,
+                'receivable_after' => customer_receivable_balance($this->pdo, $customerId),
+            ];
+        } catch (Throwable $e) {
+            $this->pdo->rollBack();
+            throw new RuntimeException($e->getMessage());
+        }
+    }
+
+    /** Record empty cylinders returned (reduces opening / baqi owed, no order required). */
+    public function recordCustomerCylinderReturn(array $data): array
+    {
+        $customerId = (int) ($data['customer_id'] ?? 0);
+        $qty = max(0, (int) ($data['cylinders_returned'] ?? 0));
+        $returnDate = (string) ($data['return_date'] ?? date('Y-m-d'));
+        $note = trim((string) ($data['note'] ?? ''));
+        if ($customerId <= 0) {
+            throw new RuntimeException('Valid customer is required.');
+        }
+        if ($qty <= 0) {
+            throw new RuntimeException('Enter how many cylinders were returned.');
+        }
+
+        $owed = customer_cylinders_owed($this->pdo, $customerId);
+        if ($qty > $owed) {
+            throw new RuntimeException("Customer only owes {$owed} cylinder(s).");
+        }
+
+        $cylinderType = normalize_cylinder_type((string) ($data['cylinder_type'] ?? standard_cylinder_size()));
+        $description = $note !== '' ? $note : __('ledger.cylinder_return_desc');
+
+        $this->pdo->beginTransaction();
+        try {
+            $this->upsertLedger(
+                $customerId,
+                0,
+                0,
+                $returnDate,
+                [
+                    'description' => $description,
+                    'sent' => 0,
+                    'received' => $qty,
+                    'baqi' => 0,
+                    'reference_type' => 'cylinder_settlement',
+                    'reference_id' => 0,
+                ]
+            );
+            inventory_receive_empty_cylinders($this->pdo, $qty, $cylinderType);
+            $this->pdo->commit();
+        } catch (Throwable $e) {
+            $this->pdo->rollBack();
+            throw new RuntimeException($e->getMessage());
+        }
+
+        $stock = cylinder_daka_tash_for_type($this->pdo, $cylinderType);
+
+        return [
+            'cylinders_returned' => $qty,
+            'cylinders_owed_after' => customer_cylinders_owed($this->pdo, $customerId),
+            'tash_stock' => (int) ($stock['tash'] ?? 0),
+        ];
+    }
+
     public function addPaymentWithAutomation(array $data): array
     {
         $invoiceId = (int) ($data['invoice_id'] ?? 0);
@@ -300,7 +423,7 @@ final class OxygenOpsService
             $totalSent = 0;
             $totalReceived = 0;
             foreach ($rows as $row) {
-                $size = (string) ($row['cylinder_size'] ?? 'Small');
+                $size = normalize_cylinder_type((string) ($row['cylinder_size'] ?? ''));
                 $sent = (int) ($row['sent_qty'] ?? 0);
                 $received = (int) ($row['received_qty'] ?? 0);
                 $baqi = (int) ($row['baqi_qty'] ?? 0);
@@ -334,20 +457,15 @@ final class OxygenOpsService
 
     private function applyInventoryIssue(array $normalizedRows, int $sentQty, int $emptyReceived): void
     {
-        $typedUpdate = $this->pdo->prepare(
-            "UPDATE cylinder_stock_by_type
-             SET available = GREATEST(0, available - ?),
-                 available_pressure = GREATEST(0, available_pressure - ?)
-             WHERE cylinder_type = ?"
-        );
         foreach ($normalizedRows as $row) {
             $rowSent = max(0, (int) ($row['sent'] ?? 0));
-            $size = (string) ($row['size'] ?? 'Small');
-            $rowPressure = max(0, (float) ($row['sold_pressure_total'] ?? 0));
-            if ($rowSent <= 0 && $rowPressure <= 0) {
+            $rowReceived = max(0, (int) ($row['received'] ?? 0));
+            $size = normalize_cylinder_type((string) ($row['size'] ?? ''));
+            if ($rowSent <= 0 && $rowReceived <= 0) {
                 continue;
             }
-            $typedUpdate->execute([$rowSent, $rowPressure, $size]);
+            // Daka (full) out, Tash (empty) in — syncs cylinder_stock_by_type.tash_qty and cylinders.empty
+            adjust_cylinder_daka_tash($this->pdo, $size, -$rowSent, $rowReceived);
         }
 
         $row = $this->pdo->query('SELECT * FROM cylinders ORDER BY id ASC LIMIT 1 FOR UPDATE')->fetch();
@@ -356,62 +474,39 @@ final class OxygenOpsService
             $insert->execute();
             $row = $this->pdo->query('SELECT * FROM cylinders ORDER BY id ASC LIMIT 1 FOR UPDATE')->fetch();
         }
-        $available = max(0, (int) $row['available'] - $sentQty);
         $issued = (int) $row['issued'] + $sentQty;
-        $empty = (int) $row['empty'] + $emptyReceived;
-
-        $update = $this->pdo->prepare('UPDATE cylinders SET available = ?, issued = ?, empty = ? WHERE id = ?');
-        $update->execute([$available, $issued, $empty, (int) $row['id']]);
+        $update = $this->pdo->prepare('UPDATE cylinders SET issued = ? WHERE id = ?');
+        $update->execute([$issued, (int) $row['id']]);
     }
 
     private function assertTypedStockAvailability(array $normalizedRows): void
     {
-        $requiredByType = ['Small' => 0, 'Medium' => 0, 'Large' => 0];
-        $requiredPressureByType = ['Small' => 0.0, 'Medium' => 0.0, 'Large' => 0.0];
+        $requiredQty = 0;
+        $requiredPressure = 0.0;
         foreach ($normalizedRows as $row) {
-            $size = (string) ($row['size'] ?? '');
-            if (!array_key_exists($size, $requiredByType)) {
-                continue;
-            }
-            $requiredByType[$size] += max(0, (int) ($row['sent'] ?? 0));
-            $requiredPressureByType[$size] += max(0, (float) ($row['sold_pressure_total'] ?? 0));
+            $requiredQty += max(0, (int) ($row['sent'] ?? 0));
+            $requiredPressure += max(0, (float) ($row['sold_pressure_total'] ?? 0));
         }
 
+        $useDaka = column_exists($this->pdo, 'cylinder_stock_by_type', 'daka_qty');
         $stockStmt = $this->pdo->query(
-            "SELECT cylinder_type, available, available_pressure
-             FROM cylinder_stock_by_type
-             WHERE cylinder_type IN ('Small','Medium','Large')
-             FOR UPDATE"
+            $useDaka
+                ? 'SELECT COALESCE(SUM(daka_qty), 0) AS available, COALESCE(SUM(available_pressure), 0) AS available_pressure FROM cylinder_stock_by_type FOR UPDATE'
+                : 'SELECT COALESCE(SUM(available), 0) AS available, COALESCE(SUM(available_pressure), 0) AS available_pressure FROM cylinder_stock_by_type FOR UPDATE'
         );
-        $availableByType = ['Small' => 0.0, 'Medium' => 0.0, 'Large' => 0.0];
-        $availablePressureByType = ['Small' => 0.0, 'Medium' => 0.0, 'Large' => 0.0];
-        foreach ($stockStmt->fetchAll() as $stockRow) {
-            $type = (string) ($stockRow['cylinder_type'] ?? '');
-            if (!array_key_exists($type, $availableByType)) {
-                continue;
-            }
-            $availableByType[$type] = max(0, (float) ($stockRow['available'] ?? 0));
-            $availablePressureByType[$type] = max(0, (float) ($stockRow['available_pressure'] ?? 0));
-        }
+        $stockRow = $stockStmt->fetch() ?: [];
+        $availableQty = max(0, (float) ($stockRow['available'] ?? 0));
+        $availablePressure = max(0, (float) ($stockRow['available_pressure'] ?? 0));
 
-        foreach ($requiredByType as $type => $requiredQty) {
-            if ($requiredQty <= 0) {
-                continue;
-            }
-            if ($availableByType[$type] + 0.00001 < $requiredQty) {
-                $availableFormatted = rtrim(rtrim(number_format($availableByType[$type], 2, '.', ''), '0'), '.');
-                throw new RuntimeException("Insufficient {$type} stock. Available: {$availableFormatted}, requested: {$requiredQty}.");
-            }
+        if ($requiredQty > 0 && $availableQty + 0.00001 < $requiredQty) {
+            $availableFormatted = rtrim(rtrim(number_format($availableQty, 2, '.', ''), '0'), '.');
+            $label = $useDaka ? 'Daka (full)' : 'stock';
+            throw new RuntimeException("Insufficient cylinder {$label}. Available: {$availableFormatted}, requested: {$requiredQty}.");
         }
-        foreach ($requiredPressureByType as $type => $requiredPressure) {
-            if ($requiredPressure <= 0) {
-                continue;
-            }
-            if ($availablePressureByType[$type] + 0.00001 < $requiredPressure) {
-                $availableFormatted = rtrim(rtrim(number_format($availablePressureByType[$type], 2, '.', ''), '0'), '.');
-                $requiredFormatted = rtrim(rtrim(number_format($requiredPressure, 2, '.', ''), '0'), '.');
-                throw new RuntimeException("Insufficient {$type} pressure stock. Available: {$availableFormatted} Bar, requested: {$requiredFormatted} Bar.");
-            }
+        if ($requiredPressure > 0 && $availablePressure + 0.00001 < $requiredPressure) {
+            $availableFormatted = rtrim(rtrim(number_format($availablePressure, 2, '.', ''), '0'), '.');
+            $requiredFormatted = rtrim(rtrim(number_format($requiredPressure, 2, '.', ''), '0'), '.');
+            throw new RuntimeException("Insufficient cylinder pressure stock. Available: {$availableFormatted} Bar, requested: {$requiredFormatted} Bar.");
         }
     }
 
@@ -502,31 +597,23 @@ final class OxygenOpsService
 
     private function reverseInventoryIssue(array $serviceRows, int $sentQty, int $emptyReceived): void
     {
-        $typedUpdate = $this->pdo->prepare(
-            "UPDATE cylinder_stock_by_type
-             SET available = GREATEST(0, available + ?),
-                 available_pressure = GREATEST(0, available_pressure + ?)
-             WHERE cylinder_type = ?"
-        );
         foreach ($serviceRows as $row) {
             $rowSent = max(0, (int) ($row['sent_qty'] ?? 0));
-            $size = (string) ($row['cylinder_size'] ?? 'Small');
-            $rowPressure = max(0, (float) ($row['sold_pressure_total'] ?? 0));
-            if ($rowSent <= 0 && $rowPressure <= 0) {
+            $rowReceived = max(0, (int) ($row['received_qty'] ?? 0));
+            $size = normalize_cylinder_type((string) ($row['cylinder_size'] ?? ''));
+            if ($rowSent <= 0 && $rowReceived <= 0) {
                 continue;
             }
-            $typedUpdate->execute([$rowSent, $rowPressure, $size]);
+            adjust_cylinder_daka_tash($this->pdo, $size, $rowSent, -$rowReceived);
         }
 
         $row = $this->pdo->query('SELECT * FROM cylinders ORDER BY id ASC LIMIT 1 FOR UPDATE')->fetch();
         if (!$row) {
             return;
         }
-        $available = max(0, (int) $row['available'] + $sentQty);
         $issued = max(0, (int) $row['issued'] - $sentQty);
-        $empty = max(0, (int) $row['empty'] - $emptyReceived);
-        $update = $this->pdo->prepare('UPDATE cylinders SET available = ?, issued = ?, empty = ? WHERE id = ?');
-        $update->execute([$available, $issued, $empty, (int) $row['id']]);
+        $update = $this->pdo->prepare('UPDATE cylinders SET issued = ? WHERE id = ?');
+        $update->execute([$issued, (int) $row['id']]);
     }
 
     private function upsertLedger(int $customerId, float $debit, float $credit, string $date, array $meta = []): void
@@ -556,6 +643,23 @@ final class OxygenOpsService
         $lastStmt = $this->pdo->prepare('SELECT balance FROM ledger WHERE customer_id = ? ORDER BY id DESC LIMIT 1');
         $lastStmt->execute([$customerId]);
         return (float) ($lastStmt->fetch()['balance'] ?? 0);
+    }
+
+    /** Net cylinder position from history (Tash − Daka); negative means customer owes cylinders. */
+    private function customerCylinderSignedNet(int $customerId): int
+    {
+        $st = $this->pdo->prepare(
+            'SELECT COALESCE(SUM(r.sent_qty), 0) AS daka, COALESCE(SUM(r.received_qty), 0) AS tash
+             FROM service_cylinder_rows r
+             INNER JOIN services s ON s.id = r.service_id
+             WHERE s.customer_id = ?'
+        );
+        $st->execute([$customerId]);
+        $row = $st->fetch();
+        if (!$row) {
+            return 0;
+        }
+        return (int) $row['tash'] - (int) $row['daka'];
     }
 
     private function applyCustomerCylinderBalance(int $customerId, string $size, int $delta): void
@@ -618,9 +722,7 @@ final class OxygenOpsService
             )
         ");
         $seedStmt = $this->pdo->prepare("INSERT IGNORE INTO cylinder_stock_by_type (cylinder_type, total, available) VALUES (?, 0, 0)");
-        foreach (['Small', 'Medium', 'Large'] as $type) {
-            $seedStmt->execute([$type]);
-        }
+        $seedStmt->execute([standard_cylinder_size()]);
         if (function_exists('column_exists')) {
             if (!column_exists($this->pdo, 'services', 'total_bill')) {
                 $this->pdo->exec("ALTER TABLE services ADD COLUMN total_bill DECIMAL(12,2) NOT NULL DEFAULT 0.00 AFTER price");

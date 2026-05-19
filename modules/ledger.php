@@ -4,20 +4,189 @@ require_once __DIR__ . '/../app/bootstrap.php';
 use App\Services\OxygenOpsService;
 
 $pdo = db();
+ensure_supplier_transaction_notes_column($pdo);
+
+$loadCustomerOrders = static function (PDO $pdo, int $customerId): array {
+    if ($customerId <= 0) {
+        return [];
+    }
+    $hasCylinderRows = table_exists($pdo, 'service_cylinder_rows');
+    $sql = 'SELECT s.id AS service_id, s.date, s.service_type, s.total_bill, s.service_charges,
+            s.previous_balance, s.grand_total, s.paid_amount, s.remaining_balance, s.notes,
+            i.id AS invoice_id,
+            COALESCE(i.total_amount, s.grand_total, 0) AS invoice_total,
+            COALESCE(i.paid_amount, s.paid_amount, 0) AS invoice_paid,
+            COALESCE(i.remaining_amount, s.remaining_balance, 0) AS invoice_remaining';
+    if ($hasCylinderRows) {
+        $sql .= ',
+            COALESCE(SUM(r.sent_qty), 0) AS cylinders_sent,
+            COALESCE(SUM(r.received_qty), 0) AS cylinders_received,
+            COALESCE(SUM(r.baqi_qty), 0) AS cylinders_baqi';
+    } else {
+        $sql .= ', COALESCE(s.quantity, 0) AS cylinders_sent, 0 AS cylinders_received, 0 AS cylinders_baqi';
+    }
+    $sql .= '
+        FROM services s
+        LEFT JOIN invoices i ON i.service_id = s.id';
+    if ($hasCylinderRows) {
+        $sql .= ' LEFT JOIN service_cylinder_rows r ON r.service_id = s.id';
+    }
+    $sql .= ' WHERE s.customer_id = ?';
+    if ($hasCylinderRows) {
+        $sql .= ' GROUP BY s.id, s.date, s.service_type, s.total_bill, s.service_charges,
+            s.previous_balance, s.grand_total, s.paid_amount, s.remaining_balance, s.notes,
+            i.id, i.total_amount, i.paid_amount, i.remaining_amount, s.quantity';
+    }
+    $sql .= ' ORDER BY s.date DESC, s.id DESC';
+    $st = $pdo->prepare($sql);
+    $st->execute([$customerId]);
+    return $st->fetchAll();
+};
+
+$loadCustomerCylinderRows = static function (PDO $pdo, int $customerId): array {
+    if ($customerId <= 0 || !table_exists($pdo, 'service_cylinder_rows')) {
+        return [];
+    }
+    $st = $pdo->prepare(
+        'SELECT r.service_id, r.cylinder_size, r.sent_qty, r.received_qty, r.baqi_qty, r.rate, r.total_amount
+         FROM service_cylinder_rows r
+         INNER JOIN services s ON s.id = r.service_id
+         WHERE s.customer_id = ?
+         ORDER BY r.service_id DESC, r.id ASC'
+    );
+    $st->execute([$customerId]);
+    $byService = [];
+    foreach ($st->fetchAll() as $row) {
+        $sid = (int) ($row['service_id'] ?? 0);
+        if (!isset($byService[$sid])) {
+            $byService[$sid] = [];
+        }
+        $byService[$sid][] = $row;
+    }
+    return $byService;
+};
+
+$buildLedgerCustomerDetailPayload = static function (PDO $pdo, int $customerId) use ($loadCustomerOrders): array {
+    if ($customerId <= 0) {
+        return ['ok' => false];
+    }
+    $st = $pdo->prepare('SELECT id FROM customers WHERE id = ? LIMIT 1');
+    $st->execute([$customerId]);
+    if (!$st->fetch()) {
+        return ['ok' => false];
+    }
+
+    $ledgerDetailCols = 'date, description, debit, credit, balance';
+    if (column_exists($pdo, 'ledger', 'reference_type')) {
+        $ledgerDetailCols .= ', reference_type';
+    }
+    if (column_exists($pdo, 'ledger', 'cylinders_sent')) {
+        $ledgerDetailCols .= ', cylinders_sent, cylinders_received, cylinders_baqi';
+    }
+    $st = $pdo->prepare("SELECT {$ledgerDetailCols} FROM ledger WHERE customer_id = ? ORDER BY date ASC, id ASC");
+    $st->execute([$customerId]);
+    $ledgerRows = $st->fetchAll();
+    $hasCylCols = column_exists($pdo, 'ledger', 'cylinders_sent');
+    $colspan = $hasCylCols ? 6 : 5;
+
+    $ledgerRowsUi = [];
+    foreach ($ledgerRows as $ledgerRow) {
+        $refType = (string) ($ledgerRow['reference_type'] ?? '');
+        $desc = trim((string) ($ledgerRow['description'] ?? ''));
+        $ledgerRowsUi[] = [
+            'date' => format_date_pk((string) $ledgerRow['date']),
+            'description' => $desc !== '' ? $desc : (string) __('common.none'),
+            'cylinders' => $hasCylCols
+                ? (string) (($ledgerRow['cylinders_sent'] ?? 0) . '/' . ($ledgerRow['cylinders_received'] ?? 0) . '/' . ($ledgerRow['cylinders_baqi'] ?? 0))
+                : '',
+            'debit' => format_currency((float) ($ledgerRow['debit'] ?? 0)),
+            'credit' => format_currency((float) ($ledgerRow['credit'] ?? 0)),
+            'balance' => format_currency((float) ($ledgerRow['balance'] ?? 0)),
+            'highlight' => in_array($refType, ['opening_balance', 'cylinder_settlement'], true),
+        ];
+    }
+
+    $st = $pdo->prepare('SELECT id, remaining_amount FROM invoices WHERE customer_id = ? ORDER BY id ASC');
+    $st->execute([$customerId]);
+    $invoiceOptions = [];
+    foreach ($st->fetchAll() as $inv) {
+        $remaining = (float) ($inv['remaining_amount'] ?? 0);
+        if ($remaining <= 0.00001) {
+            continue;
+        }
+        $invId = (int) ($inv['id'] ?? 0);
+        $invoiceOptions[] = [
+            'id' => $invId,
+            'label' => 'INV-' . $invId . ' (' . __('status.due') . ': ' . format_currency($remaining) . ')',
+            'remaining' => $remaining,
+        ];
+    }
+
+    $ordersUi = [];
+    foreach ($loadCustomerOrders($pdo, $customerId) as $order) {
+        $paid = (float) ($order['invoice_paid'] ?? 0);
+        $remaining = (float) ($order['invoice_remaining'] ?? 0);
+        $status = payment_status_from_amounts((float) ($order['invoice_total'] ?? 0), $paid);
+        $ordersUi[] = [
+            'service_id' => (int) ($order['service_id'] ?? 0),
+            'paid_formatted' => format_currency($paid),
+            'remaining_formatted' => format_currency($remaining),
+            'remaining_raw' => $remaining,
+            'status_label' => payment_status_label($status),
+            'status_class' => $status === 'Paid' ? 'status-paid' : ($status === 'Partial' ? 'status-partial' : 'status-due'),
+        ];
+    }
+
+    return [
+        'ok' => true,
+        'snapshot' => customer_account_snapshot_for_ui($pdo, $customerId),
+        'ledger_rows' => $ledgerRowsUi,
+        'ledger_colspan' => $colspan,
+        'ledger_has_cyl' => $hasCylCols,
+        'invoices' => $invoiceOptions,
+        'orders' => $ordersUi,
+    ];
+};
 
 // Balance JSON for services.php (expects customer_id)
 if (($_GET['ajax'] ?? '') === 'balance') {
     $cid = (int) ($_GET['customer_id'] ?? 0);
-    $balance = 0.0;
+    $payload = ['ok' => true, 'balance' => 0.0, 'receivable' => 0.0];
     if ($cid > 0) {
-        $st = $pdo->prepare('SELECT debit, credit FROM ledger WHERE customer_id = ?');
-        $st->execute([$cid]);
-        foreach ($st->fetchAll() as $r) {
-            $balance += (float) $r['debit'] - (float) $r['credit'];
-        }
+        $snap = customer_account_snapshot_for_ui($pdo, $cid);
+        $payload = array_merge($payload, $snap);
+        $payload['balance'] = (float) $snap['receivable'];
     }
     header('Content-Type: application/json; charset=utf-8');
-    echo json_encode(['ok' => true, 'balance' => $balance], JSON_UNESCAPED_UNICODE);
+    echo json_encode($payload, JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+if (($_GET['ajax'] ?? '') === 'finance_pulse') {
+    header('Content-Type: application/json; charset=utf-8');
+    $cashFrom = trim((string) ($_GET['cash_from'] ?? ''));
+    $cashTo = trim((string) ($_GET['cash_to'] ?? ''));
+    $pulse = financial_system_pulse(
+        $pdo,
+        preg_match('/^\d{4}-\d{2}-\d{2}$/', $cashFrom) ? $cashFrom : null,
+        preg_match('/^\d{4}-\d{2}-\d{2}$/', $cashTo) ? $cashTo : null
+    );
+    $cid = (int) ($_GET['customer_id'] ?? 0);
+    if ($cid > 0) {
+        $pulse['customer'] = customer_receivable_map($pdo, [$cid])[$cid] ?? [
+            'receivable' => 0.0,
+            'receivable_formatted' => format_currency(0),
+        ];
+    }
+    echo json_encode(['ok' => true, 'pulse' => $pulse], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+if (($_GET['ajax'] ?? '') === 'customer_detail') {
+    header('Content-Type: application/json; charset=utf-8');
+    $cid = (int) ($_GET['customer_id'] ?? 0);
+    $payload = $buildLedgerCustomerDetailPayload($pdo, $cid);
+    echo json_encode($payload, JSON_UNESCAPED_UNICODE);
     exit;
 }
 
@@ -36,14 +205,20 @@ if (($_GET['ajax'] ?? '') === 'search_customers') {
 }
 
 $customerSearch = trim((string) ($_GET['q'] ?? ''));
-$supplierSearch = trim((string) ($_GET['supplier_q'] ?? ''));
-$entity = trim((string) ($_GET['entity'] ?? 'customer'));
+$entity = 'customer';
 $export = trim((string) ($_GET['export'] ?? ''));
 $viewCustomerId = (int) ($_GET['view_customer'] ?? 0);
 $viewSupplierId = (int) ($_GET['view_supplier'] ?? 0);
-if (!in_array($entity, ['customer', 'supplier'], true)) {
-    $entity = 'customer';
+$legacySupplierQ = trim((string) ($_GET['supplier_q'] ?? ''));
+if ($entity === 'supplier' || $viewSupplierId > 0 || $legacySupplierQ !== '') {
+    if ($viewSupplierId > 0) {
+        header('Location: ?module=suppliers&action=view_ledger&id=' . $viewSupplierId . i18n_lang_query());
+        exit;
+    }
+    header('Location: ?module=suppliers' . i18n_lang_query());
+    exit;
 }
+$entity = 'customer';
 
 $renderA4Document = static function (string $title, string $bodyHtml): void {
     echo '<!doctype html><html><head><meta charset="utf-8"><title>' . e($title) . '</title>';
@@ -67,76 +242,90 @@ $renderA4Document = static function (string $title, string $bodyHtml): void {
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $action = trim((string) request_value('action'));
-    if ($action === 'add_customer_due_payment') {
-        $invoiceId = (int) request_value('invoice_id', '0');
-        $amount = (float) request_value('amount', '0');
-        $paymentDate = request_value('payment_date', date('Y-m-d'));
-        if ($invoiceId > 0 && $amount > 0) {
-            $ops = new OxygenOpsService();
-            $ops->addPaymentWithAutomation([
-                'invoice_id' => $invoiceId,
-                'amount' => $amount,
-                'payment_date' => $paymentDate,
-            ]);
+    $redirectCustomerId = (int) request_value('customer_id', '0');
+    $ledgerAjax = isset($_SERVER['HTTP_X_REQUESTED_WITH'])
+        && strtolower((string) $_SERVER['HTTP_X_REQUESTED_WITH']) === 'xmlhttprequest';
+    $ops = new OxygenOpsService();
+    try {
+        if ($action === 'add_customer_due_payment') {
+            $invoiceId = (int) request_value('invoice_id', '0');
+            $amount = (float) request_value('amount', '0');
+            $paymentDate = request_value('payment_date', date('Y-m-d'));
+            if ($invoiceId > 0 && $amount > 0) {
+                $ops->addPaymentWithAutomation([
+                    'invoice_id' => $invoiceId,
+                    'amount' => $amount,
+                    'payment_date' => $paymentDate,
+                ]);
+            }
+        } elseif ($action === 'add_customer_receive_payment') {
+            $amount = (float) request_value('amount', '0');
+            $paymentDate = request_value('payment_date', date('Y-m-d'));
+            $note = request_value('payment_note');
+            if ($redirectCustomerId > 0 && $amount > 0) {
+                $ops->receiveCustomerPayment([
+                    'customer_id' => $redirectCustomerId,
+                    'amount' => $amount,
+                    'payment_date' => $paymentDate,
+                    'note' => $note,
+                ]);
+            }
+        } elseif ($action === 'add_customer_cylinder_return') {
+            $qty = (int) request_value('cylinders_returned', '0');
+            $returnDate = request_value('return_date', date('Y-m-d'));
+            $note = request_value('return_note');
+            if ($redirectCustomerId > 0 && $qty > 0) {
+                $ops->recordCustomerCylinderReturn([
+                    'customer_id' => $redirectCustomerId,
+                    'cylinders_returned' => $qty,
+                    'return_date' => $returnDate,
+                    'note' => $note,
+                ]);
+            }
         }
-        $redirectCustomerId = (int) request_value('customer_id', '0');
-        header('Location: ?module=ledger&entity=customer&view_customer=' . $redirectCustomerId . i18n_lang_query());
+    } catch (Throwable $e) {
+        if ($ledgerAjax) {
+            header('Content-Type: application/json; charset=utf-8');
+            echo json_encode(['ok' => false, 'message' => $e->getMessage()], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        header('Location: ?module=ledger&view_customer=' . $redirectCustomerId . '&err=' . urlencode($e->getMessage()) . i18n_lang_query());
         exit;
     }
-    if ($action === 'add_supplier_due_payment') {
-        $supplierId = (int) request_value('supplier_id', '0');
-        $transactionId = (int) request_value('transaction_id', '0');
-        $amount = (float) request_value('amount', '0');
-        $paymentType = request_value('payment_type', 'Cash');
-        $paymentDate = request_value('payment_date', date('Y-m-d'));
-        if ($supplierId > 0 && $transactionId > 0 && $amount > 0) {
-            $pdo->prepare("INSERT INTO supplier_payments (supplier_id, transaction_id, amount, payment_type, payment_date) VALUES (?, ?, ?, ?, ?)")
-                ->execute([$supplierId, $transactionId, $amount, $paymentType, $paymentDate]);
-            $sumStmt = $pdo->prepare("SELECT COALESCE(SUM(amount),0) FROM supplier_payments WHERE transaction_id = ?");
-            $sumStmt->execute([$transactionId]);
-            $paidTotal = (float) $sumStmt->fetchColumn();
-            $txStmt = $pdo->prepare("SELECT total_amount FROM supplier_transactions WHERE id = ?");
-            $txStmt->execute([$transactionId]);
-            $total = (float) $txStmt->fetchColumn();
-            $remaining = max(0, $total - $paidTotal);
-            $status = $remaining <= 0.00001 ? 'PAID' : ($paidTotal > 0 ? 'PARTIAL' : 'DUE');
-            $pdo->prepare("UPDATE supplier_transactions SET paid_amount = ?, remaining_amount = ?, payment_status = ? WHERE id = ?")
-                ->execute([$paidTotal, $remaining, $status, $transactionId]);
-
-            $balStmt = $pdo->prepare("SELECT balance FROM supplier_ledger WHERE supplier_id = ? ORDER BY id DESC LIMIT 1");
-            $balStmt->execute([$supplierId]);
-            $lastBalance = (float) ($balStmt->fetchColumn() ?: 0);
-            $newBalance = $lastBalance - $amount;
-            $pdo->prepare("INSERT INTO supplier_ledger (supplier_id, debit, credit, balance, reference_type, reference_id, description, entry_date) VALUES (?, 0, ?, ?, 'payment', ?, ?, ?)")
-                ->execute([$supplierId, $amount, $newBalance, $transactionId, 'Payment received via ledger view', $paymentDate]);
+    if ($redirectCustomerId > 0) {
+        if ($ledgerAjax) {
+            header('Content-Type: application/json; charset=utf-8');
+            $detail = $buildLedgerCustomerDetailPayload($pdo, $redirectCustomerId);
+            echo json_encode([
+                'ok' => true,
+                'snapshot' => $detail['snapshot'] ?? customer_account_snapshot_for_ui($pdo, $redirectCustomerId),
+                'detail' => $detail,
+                'pulse' => financial_system_pulse($pdo),
+            ], JSON_UNESCAPED_UNICODE);
+            exit;
         }
-        header('Location: ?module=ledger&entity=supplier&view_supplier=' . $supplierId . i18n_lang_query());
+        header('Location: ?module=ledger&view_customer=' . $redirectCustomerId . i18n_lang_query());
         exit;
     }
 }
 
 $customerLedgerRows = [];
-$supplierLedgerRows = [];
 $customerSummary = ['debit' => 0.0, 'credit' => 0.0, 'balance' => 0.0, 'due' => 0.0, 'remaining' => 0.0];
-$supplierSummary = ['debit' => 0.0, 'credit' => 0.0, 'balance' => 0.0, 'due' => 0.0, 'remaining' => 0.0];
 $customerDueMap = [];
-$supplierDueMap = [];
 $matchedCustomerCount = 0;
-$matchedSupplierCount = 0;
 
 $customerIds = [];
-if ($entity === 'customer') {
-    if ($customerSearch !== '') {
-        $like = '%' . $customerSearch . '%';
-        $idsSt = $pdo->prepare('SELECT id FROM customers WHERE name LIKE ? OR phone LIKE ? ORDER BY name ASC');
-        $idsSt->execute([$like, $like]);
-    } else {
-        $idsSt = $pdo->query('SELECT id FROM customers ORDER BY name ASC');
-    }
-    $customerIds = array_values(array_unique(array_map(static fn ($id): int => (int) $id, array_column($idsSt->fetchAll(), 'id'))));
-    $ids = $customerIds;
-    $matchedCustomerCount = count($ids);
-    if ($ids !== []) {
+if ($customerSearch !== '') {
+    $like = '%' . $customerSearch . '%';
+    $idsSt = $pdo->prepare('SELECT id FROM customers WHERE name LIKE ? OR phone LIKE ? ORDER BY name ASC');
+    $idsSt->execute([$like, $like]);
+} else {
+    $idsSt = $pdo->query('SELECT id FROM customers ORDER BY name ASC');
+}
+$customerIds = array_values(array_unique(array_map(static fn ($id): int => (int) $id, array_column($idsSt->fetchAll(), 'id'))));
+$ids = $customerIds;
+$matchedCustomerCount = count($ids);
+if ($ids !== []) {
         $invoiceTotalExpr = column_exists($pdo, 'invoices', 'total_amount') ? 'COALESCE(total_amount, 0)' : 'COALESCE(grand_total, 0)';
         $ph = implode(',', array_fill(0, count($ids), '?'));
         $dueSt = $pdo->prepare("SELECT customer_id, COALESCE(SUM({$invoiceTotalExpr}),0) AS due_payment, COALESCE(SUM(remaining_amount),0) AS remaining_balance FROM invoices WHERE customer_id IN ($ph) GROUP BY customer_id");
@@ -193,53 +382,6 @@ if ($entity === 'customer') {
             $customerSummary['balance'] = $customerSummary['debit'] - $customerSummary['credit'];
         }
     }
-}
-
-$supplierIds = [];
-if ($entity === 'supplier') {
-    if ($supplierSearch !== '') {
-        $like = '%' . $supplierSearch . '%';
-        $idsSt = $pdo->prepare('SELECT id FROM suppliers WHERE name LIKE ? OR phone LIKE ? OR contact_person LIKE ? ORDER BY name ASC');
-        $idsSt->execute([$like, $like, $like]);
-    } else {
-        $idsSt = $pdo->query('SELECT id FROM suppliers ORDER BY name ASC');
-    }
-    $supplierIds = array_values(array_unique(array_map(static fn ($id): int => (int) $id, array_column($idsSt->fetchAll(), 'id'))));
-    $ids = $supplierIds;
-    $matchedSupplierCount = count($ids);
-    if ($ids !== []) {
-        $ph = implode(',', array_fill(0, count($ids), '?'));
-        $dueSt = $pdo->prepare("SELECT supplier_id, COALESCE(SUM(total_amount),0) AS due_payment, COALESCE(SUM(remaining_amount),0) AS remaining_balance FROM supplier_transactions WHERE supplier_id IN ($ph) GROUP BY supplier_id");
-        $dueSt->execute($ids);
-        foreach ($dueSt->fetchAll() as $row) {
-            $sid = (int) $row['supplier_id'];
-            $supplierDueMap[$sid] = [
-                'due_payment' => (float) $row['due_payment'],
-                'remaining_balance' => (float) $row['remaining_balance'],
-            ];
-            $supplierSummary['due'] += (float) $row['due_payment'];
-            $supplierSummary['remaining'] += (float) $row['remaining_balance'];
-        }
-
-        $st = $pdo->prepare("SELECT s.id AS supplier_id, s.name AS supplier_name, s.phone AS supplier_phone,
-                COALESCE(MAX(t.transaction_date), '') AS last_transaction_date,
-                COALESCE(SUM(t.total_amount), 0) AS total_due,
-                COALESCE(SUM(t.paid_amount), 0) AS total_paid,
-                COALESCE(SUM(t.remaining_amount), 0) AS remaining_balance
-            FROM suppliers s
-            LEFT JOIN supplier_transactions t ON t.supplier_id = s.id
-            WHERE s.id IN ($ph)
-            GROUP BY s.id, s.name, s.phone
-            ORDER BY s.name ASC");
-        $st->execute($ids);
-        $supplierLedgerRows = $st->fetchAll();
-        foreach ($supplierLedgerRows as $row) {
-            $supplierSummary['debit'] += (float) ($row['total_due'] ?? 0);
-            $supplierSummary['credit'] += (float) ($row['total_paid'] ?? 0);
-        }
-        $supplierSummary['balance'] = $supplierSummary['debit'] - $supplierSummary['credit'];
-    }
-}
 
 if ($export === 'customer_csv') {
     $invoiceTotalExpr = column_exists($pdo, 'invoices', 'total_amount') ? 'COALESCE(total_amount, 0)' : 'COALESCE(grand_total, 0)';
@@ -289,49 +431,36 @@ if ($export === 'customer_csv') {
 }
 
 if ($export === 'customer_detail_csv' && $viewCustomerId > 0) {
-    $st = $pdo->prepare("SELECT c.name, c.phone, l.date, l.debit, l.credit, l.balance, l.description
-        FROM ledger l INNER JOIN customers c ON c.id = l.customer_id
-        WHERE l.customer_id = ? ORDER BY l.date ASC, l.id ASC");
+    $st = $pdo->prepare('SELECT name, phone FROM customers WHERE id = ?');
     $st->execute([$viewCustomerId]);
-    $rows = $st->fetchAll();
+    $cust = $st->fetch() ?: ['name' => '', 'phone' => ''];
+    $orders = $loadCustomerOrders($pdo, $viewCustomerId);
     header('Content-Type: text/csv; charset=utf-8');
     header('Content-Disposition: attachment; filename=customer-ledger-detail-' . $viewCustomerId . '-' . date('Ymd-His') . '.csv');
     $out = fopen('php://output', 'wb');
-    fputcsv($out, ['Date', 'Customer', 'Phone', 'Description', 'Debit', 'Credit', 'Balance']);
-    foreach ($rows as $row) {
+    fputcsv($out, [
+        'Date', 'Customer', 'Phone', 'Order', 'Description', 'Daka', 'Tash', 'Baqi', 'Gas total', 'Service charges',
+        'Previous balance', 'Grand total', 'Paid', 'Remaining', 'Invoice',
+    ]);
+    foreach ($orders as $order) {
+        $serviceCharges = (float) ($order['service_charges'] ?? 0);
+        $totalBill = (float) ($order['total_bill'] ?? 0);
         fputcsv($out, [
-            (string) ($row['date'] ?? ''),
-            (string) ($row['name'] ?? ''),
-            (string) ($row['phone'] ?? ''),
-            (string) ($row['description'] ?? ''),
-            number_format((float) ($row['debit'] ?? 0), 2, '.', ''),
-            number_format((float) ($row['credit'] ?? 0), 2, '.', ''),
-            number_format((float) ($row['balance'] ?? 0), 2, '.', ''),
-        ]);
-    }
-    fclose($out);
-    exit;
-}
-
-if ($export === 'supplier_detail_csv' && $viewSupplierId > 0) {
-    $st = $pdo->prepare("SELECT s.name, s.phone, l.entry_date, l.debit, l.credit, l.balance, l.description
-        FROM supplier_ledger l INNER JOIN suppliers s ON s.id = l.supplier_id
-        WHERE l.supplier_id = ? ORDER BY l.entry_date ASC, l.id ASC");
-    $st->execute([$viewSupplierId]);
-    $rows = $st->fetchAll();
-    header('Content-Type: text/csv; charset=utf-8');
-    header('Content-Disposition: attachment; filename=supplier-ledger-detail-' . $viewSupplierId . '-' . date('Ymd-His') . '.csv');
-    $out = fopen('php://output', 'wb');
-    fputcsv($out, ['Date', 'Supplier', 'Phone', 'Description', 'Debit', 'Credit', 'Balance']);
-    foreach ($rows as $row) {
-        fputcsv($out, [
-            (string) ($row['entry_date'] ?? ''),
-            (string) ($row['name'] ?? ''),
-            (string) ($row['phone'] ?? ''),
-            (string) ($row['description'] ?? ''),
-            number_format((float) ($row['debit'] ?? 0), 2, '.', ''),
-            number_format((float) ($row['credit'] ?? 0), 2, '.', ''),
-            number_format((float) ($row['balance'] ?? 0), 2, '.', ''),
+            (string) ($order['date'] ?? ''),
+            (string) ($cust['name'] ?? ''),
+            (string) ($cust['phone'] ?? ''),
+            'ORD-' . (int) ($order['service_id'] ?? 0),
+            trim((string) ($order['notes'] ?? '')),
+            (int) ($order['cylinders_sent'] ?? 0),
+            (int) ($order['cylinders_received'] ?? 0),
+            (int) ($order['cylinders_baqi'] ?? 0),
+            number_format(max(0, $totalBill - $serviceCharges), 2, '.', ''),
+            number_format($serviceCharges, 2, '.', ''),
+            number_format((float) ($order['previous_balance'] ?? 0), 2, '.', ''),
+            number_format((float) ($order['grand_total'] ?? 0), 2, '.', ''),
+            number_format((float) ($order['invoice_paid'] ?? 0), 2, '.', ''),
+            number_format((float) ($order['invoice_remaining'] ?? 0), 2, '.', ''),
+            (int) ($order['invoice_id'] ?? 0) > 0 ? 'INV-' . (int) $order['invoice_id'] : '',
         ]);
     }
     fclose($out);
@@ -345,21 +474,25 @@ if (($export === 'customer_detail_pdf' || $export === 'customer_detail_print') &
     if (!$detail) {
         exit('Customer not found.');
     }
-    $st = $pdo->prepare('SELECT id, total_amount, paid_amount, remaining_amount FROM invoices WHERE customer_id = ? ORDER BY id DESC');
-    $st->execute([$viewCustomerId]);
-    $invoices = $st->fetchAll();
+    $orders = $loadCustomerOrders($pdo, $viewCustomerId);
     $st = $pdo->prepare('SELECT p.payment_date, p.amount, p.invoice_id FROM payments p INNER JOIN invoices i ON i.id = p.invoice_id WHERE i.customer_id = ? ORDER BY p.payment_date DESC, p.id DESC');
     $st->execute([$viewCustomerId]);
-    $payments = $st->fetchAll();
-    $st = $pdo->prepare('SELECT date, description, debit, credit, balance FROM ledger WHERE customer_id = ? ORDER BY date DESC, id DESC');
-    $st->execute([$viewCustomerId]);
-    $ledgerRows = $st->fetchAll();
+    $paymentsByInvoice = [];
+    foreach ($st->fetchAll() as $p) {
+        $invId = (int) ($p['invoice_id'] ?? 0);
+        if (!isset($paymentsByInvoice[$invId])) {
+            $paymentsByInvoice[$invId] = [];
+        }
+        $paymentsByInvoice[$invId][] = $p;
+    }
 
-    $invoiceTotal = 0.0; $invoicePaid = 0.0; $invoiceRemaining = 0.0;
-    foreach ($invoices as $inv) {
-        $invoiceTotal += (float) ($inv['total_amount'] ?? 0);
-        $invoicePaid += (float) ($inv['paid_amount'] ?? 0);
-        $invoiceRemaining += (float) ($inv['remaining_amount'] ?? 0);
+    $invoiceTotal = 0.0;
+    $invoicePaid = 0.0;
+    $invoiceRemaining = 0.0;
+    foreach ($orders as $order) {
+        $invoiceTotal += (float) ($order['invoice_total'] ?? 0);
+        $invoicePaid += (float) ($order['invoice_paid'] ?? 0);
+        $invoiceRemaining += (float) ($order['invoice_remaining'] ?? 0);
     }
 
     ob_start();
@@ -376,192 +509,102 @@ if (($export === 'customer_detail_pdf' || $export === 'customer_detail_print') &
         <div class="card"><strong><?= e(__('ledger.total_paid')) ?></strong><br><?= e(format_currency($invoicePaid)) ?></div>
         <div class="card"><strong><?= e(__('customers.col_outstanding')) ?></strong><br><?= e(format_currency($invoiceRemaining)) ?></div>
     </div>
-    <h2><?= e(__('ledger.invoices')) ?></h2>
-    <table>
-        <thead><tr><th><?= e(__('invoices.col_invoice')) ?></th><th><?= e(__('common.total')) ?></th><th><?= e(__('common.paid')) ?></th><th><?= e(__('common.remaining')) ?></th></tr></thead>
-        <tbody>
-        <?php if (!$invoices): ?><tr><td colspan="4"><?= e(__('ledger.no_invoices')) ?></td></tr><?php endif; ?>
-        <?php foreach ($invoices as $inv): ?>
-            <tr>
-                <td>INV-<?= (int) $inv['id'] ?></td>
-                <td class="text-right"><?= e(format_currency((float) $inv['total_amount'])) ?></td>
-                <td class="text-right"><?= e(format_currency((float) $inv['paid_amount'])) ?></td>
-                <td class="text-right"><?= e(format_currency((float) $inv['remaining_amount'])) ?></td>
-            </tr>
-        <?php endforeach; ?>
-        </tbody>
-    </table>
-    <h2><?= e(__('ledger.payments')) ?></h2>
-    <table>
-        <thead><tr><th><?= e(__('common.date')) ?></th><th><?= e(__('invoices.col_invoice')) ?></th><th><?= e(__('payments.amount')) ?></th></tr></thead>
-        <tbody>
-        <?php if (!$payments): ?><tr><td colspan="3"><?= e(__('ledger.no_payments')) ?></td></tr><?php endif; ?>
-        <?php foreach ($payments as $p): ?>
-            <tr>
-                <td><?= e(format_date_pk((string) $p['payment_date'])) ?></td>
-                <td>INV-<?= (int) $p['invoice_id'] ?></td>
-                <td class="text-right"><?= e(format_currency((float) $p['amount'])) ?></td>
-            </tr>
-        <?php endforeach; ?>
-        </tbody>
-    </table>
-    <h2><?= e(__('ledger.ledger_transactions')) ?></h2>
-    <table>
-        <thead><tr><th><?= e(__('common.date')) ?></th><th><?= e(__('ledger.col_desc')) ?></th><th><?= e(__('ledger.col_debit')) ?></th><th><?= e(__('ledger.col_credit')) ?></th><th><?= e(__('ledger.col_balance')) ?></th></tr></thead>
-        <tbody>
-        <?php if (!$ledgerRows): ?><tr><td colspan="5"><?= e(__('ledger.no_ledger_transactions')) ?></td></tr><?php endif; ?>
-        <?php foreach ($ledgerRows as $l): ?>
-            <tr>
-                <td><?= e(format_date_pk((string) $l['date'])) ?></td>
-                <td><?= e((string) ($l['description'] ?? '—')) ?></td>
-                <td class="text-right"><?= e(format_currency((float) $l['debit'])) ?></td>
-                <td class="text-right"><?= e(format_currency((float) $l['credit'])) ?></td>
-                <td class="text-right"><?= e(format_currency((float) $l['balance'])) ?></td>
-            </tr>
-        <?php endforeach; ?>
-        </tbody>
-    </table>
+    <h2><?= e(__('ledger.order_history')) ?></h2>
+    <?php if (!$orders): ?>
+        <p><?= e(__('ledger.no_orders')) ?></p>
+    <?php endif; ?>
+    <?php foreach ($orders as $order): ?>
+        <?php
+        $serviceId = (int) ($order['service_id'] ?? 0);
+        $invoiceId = (int) ($order['invoice_id'] ?? 0);
+        $serviceCharges = (float) ($order['service_charges'] ?? 0);
+        $totalBill = (float) ($order['total_bill'] ?? 0);
+        $gasTotal = max(0, $totalBill - $serviceCharges);
+        $paid = (float) ($order['invoice_paid'] ?? 0);
+        $remaining = (float) ($order['invoice_remaining'] ?? 0);
+        $status = payment_status_from_amounts((float) ($order['invoice_total'] ?? 0), $paid);
+        $orderPayments = $paymentsByInvoice[$invoiceId] ?? [];
+        ?>
+        <div class="card mb-10">
+            <strong><?= e(__('ledger.order_ref')) ?> ORD-<?= $serviceId ?></strong>
+            (<?= e(format_date_pk((string) $order['date'])) ?>)
+            — <?= e(payment_status_label($status)) ?>
+            <table>
+                <tr><td><?= e(__('ledger.col_desc')) ?></td><td><?= e(trim((string) ($order['notes'] ?? '')) !== '' ? trim((string) $order['notes']) : (string) __('common.none')) ?></td></tr>
+                <tr><td><?= e(__('ledger.daka')) ?></td><td class="text-right"><?= (int) ($order['cylinders_sent'] ?? 0) ?></td></tr>
+                <tr><td><?= e(__('ledger.tash')) ?></td><td class="text-right"><?= (int) ($order['cylinders_received'] ?? 0) ?></td></tr>
+                <tr><td><?= e(__('ledger.baqi')) ?></td><td class="text-right"><?= (int) ($order['cylinders_baqi'] ?? 0) ?></td></tr>
+                <tr><td><?= e(__('ledger.gas_total')) ?></td><td class="text-right"><?= e(format_currency($gasTotal)) ?></td></tr>
+                <tr><td><?= e(__('ledger.service_charges')) ?></td><td class="text-right"><?= e(format_currency($serviceCharges)) ?></td></tr>
+                <tr><td><?= e(__('ledger.previous_balance')) ?></td><td class="text-right"><?= e(format_currency((float) ($order['previous_balance'] ?? 0))) ?></td></tr>
+                <tr><td><?= e(__('ledger.grand_total')) ?></td><td class="text-right"><?= e(format_currency((float) ($order['grand_total'] ?? 0))) ?></td></tr>
+                <tr><td><?= e(__('ledger.paid_on_order')) ?></td><td class="text-right"><?= e(format_currency($paid)) ?></td></tr>
+                <tr><td><?= e(__('common.remaining')) ?></td><td class="text-right"><?= e(format_currency($remaining)) ?></td></tr>
+            </table>
+            <?php if ($orderPayments): ?>
+                <p><strong><?= e(__('ledger.payments_on_bill')) ?></strong></p>
+                <ul>
+                <?php foreach ($orderPayments as $p): ?>
+                    <li><?= e(format_date_pk((string) $p['payment_date'])) ?> — <?= e(format_currency((float) $p['amount'])) ?></li>
+                <?php endforeach; ?>
+                </ul>
+            <?php endif; ?>
+        </div>
+    <?php endforeach; ?>
     <?php
     $body = (string) ob_get_clean();
     $renderA4Document('Customer Ledger Detail', $body);
     exit;
 }
 
-if (($export === 'supplier_detail_pdf' || $export === 'supplier_detail_print') && $viewSupplierId > 0) {
-    $st = $pdo->prepare('SELECT id, name, phone, contact_person FROM suppliers WHERE id = ?');
-    $st->execute([$viewSupplierId]);
-    $detail = $st->fetch();
-    if (!$detail) {
-        exit('Supplier not found.');
-    }
-    $st = $pdo->prepare("SELECT t.id, t.transaction_date, t.total_amount, t.paid_amount, t.remaining_amount, t.payment_status,
-        t.sent_qty_small, t.sent_qty_medium, t.sent_qty_large,
-        t.sent_pressure_small, t.sent_pressure_medium, t.sent_pressure_large,
-        (SELECT GROUP_CONCAT(CONCAT(COALESCE(b.refill_cylinder_type, ''), ':', COALESCE(b.quantity, 0), ':', COALESCE(b.pressure_received, 0)) ORDER BY b.id ASC SEPARATOR '|')
-            FROM supplier_refill_breakdown b WHERE b.transaction_id = t.id) AS refill_breakdown
-        FROM supplier_transactions t
-        WHERE t.supplier_id = ?
-        ORDER BY t.transaction_date DESC, t.id DESC");
-    $st->execute([$viewSupplierId]);
-    $transactions = $st->fetchAll();
-    $st = $pdo->prepare('SELECT payment_date, amount, transaction_id, payment_type FROM supplier_payments WHERE supplier_id = ? ORDER BY payment_date DESC, id DESC');
-    $st->execute([$viewSupplierId]);
-    $payments = $st->fetchAll();
-    $st = $pdo->prepare('SELECT entry_date, description, debit, credit, balance FROM supplier_ledger WHERE supplier_id = ? ORDER BY entry_date DESC, id DESC');
-    $st->execute([$viewSupplierId]);
-    $ledgerRows = $st->fetchAll();
-
-    $purchaseTotal = 0.0; $purchasePaid = 0.0; $purchaseRemaining = 0.0;
-    foreach ($transactions as $tx) {
-        $purchaseTotal += (float) ($tx['total_amount'] ?? 0);
-        $purchasePaid += (float) ($tx['paid_amount'] ?? 0);
-        $purchaseRemaining += (float) ($tx['remaining_amount'] ?? 0);
-    }
-
-    ob_start();
-    ?>
-    <h1><?= e(__('ledger.supplier_ledger_detail')) ?></h1>
-    <div class="muted mb-10"><?= e(__('ledger.generated')) ?>: <?= e(date('Y-m-d H:i')) ?></div>
-    <div class="grid mb-10">
-        <div class="card"><strong><?= e(__('suppliers.col_supplier')) ?></strong><br><?= e((string) $detail['name']) ?></div>
-        <div class="card"><strong><?= e(__('customers.label_phone')) ?></strong><br><?= e((string) ($detail['phone'] ?? '-')) ?></div>
-        <div class="card"><strong><?= e(__('suppliers.col_contact')) ?></strong><br><?= e((string) ($detail['contact_person'] ?? '-')) ?></div>
-    </div>
-    <div class="grid mb-10">
-        <div class="card"><strong><?= e(__('ledger.total_purchases')) ?></strong><br><?= e(format_currency($purchaseTotal)) ?></div>
-        <div class="card"><strong><?= e(__('ledger.total_paid')) ?></strong><br><?= e(format_currency($purchasePaid)) ?></div>
-        <div class="card"><strong><?= e(__('customers.col_outstanding')) ?></strong><br><?= e(format_currency($purchaseRemaining)) ?></div>
-    </div>
-    <h2><?= e(__('ledger.transactions')) ?></h2>
-    <table>
-        <thead><tr><th><?= e(__('common.date')) ?></th><th><?= e(__('suppliers.col_purchase_ref')) ?></th><th><?= e(__('ledger.stock_breakdown')) ?></th><th><?= e(__('common.total')) ?></th><th><?= e(__('common.paid')) ?></th><th><?= e(__('common.remaining')) ?></th><th><?= e(__('common.status')) ?></th></tr></thead>
-        <tbody>
-        <?php if (!$transactions): ?><tr><td colspan="7"><?= e(__('ledger.no_transactions')) ?></td></tr><?php endif; ?>
-        <?php foreach ($transactions as $tx): ?>
-            <?php
-            $sent = [];
-            foreach ([['Small','small'],['Medium','medium'],['Large','large']] as $p) {
-                $qty = (int) ($tx['sent_qty_' . $p[1]] ?? 0);
-                $psi = (float) ($tx['sent_pressure_' . $p[1]] ?? 0);
-                if ($qty > 0) { $sent[] = $p[0] . ' ' . $qty . ' (' . number_format($psi, 0) . ' PSI)'; }
-            }
-            $recv = [];
-            foreach (explode('|', (string) ($tx['refill_breakdown'] ?? '')) as $chunk) {
-                if ($chunk === '') continue;
-                [$sz, $q, $p] = array_pad(explode(':', $chunk), 3, '0');
-                $qv = (float) $q;
-                if ($qv > 0) { $recv[] = trim((string) $sz) . ' ' . rtrim(rtrim(number_format($qv, 2, '.', ''), '0'), '.') . ' (' . number_format((float) $p, 0) . ' PSI)'; }
-            }
-            ?>
-            <tr>
-                <td><?= e(format_date_pk((string) $tx['transaction_date'])) ?></td>
-                <td>SP-<?= (int) $tx['id'] ?></td>
-                <td><?= e(__('ledger.sent')) ?>: <?= e($sent ? implode(' | ', $sent) : '—') ?><br><?= e(__('ledger.received')) ?>: <?= e($recv ? implode(' | ', $recv) : '—') ?></td>
-                <td class="text-right"><?= e(format_currency((float) $tx['total_amount'])) ?></td>
-                <td class="text-right"><?= e(format_currency((float) $tx['paid_amount'])) ?></td>
-                <td class="text-right"><?= e(format_currency((float) $tx['remaining_amount'])) ?></td>
-                <td><?= e((string) ($tx['payment_status'] ?? '')) ?></td>
-            </tr>
-        <?php endforeach; ?>
-        </tbody>
-    </table>
-    <h2><?= e(__('ledger.payments')) ?></h2>
-    <table>
-        <thead><tr><th><?= e(__('common.date')) ?></th><th><?= e(__('suppliers.col_purchase_ref')) ?></th><th><?= e(__('payments.method')) ?></th><th><?= e(__('payments.amount')) ?></th></tr></thead>
-        <tbody>
-        <?php if (!$payments): ?><tr><td colspan="4"><?= e(__('ledger.no_payments')) ?></td></tr><?php endif; ?>
-        <?php foreach ($payments as $p): ?>
-            <tr>
-                <td><?= e(format_date_pk((string) $p['payment_date'])) ?></td>
-                <td>SP-<?= (int) $p['transaction_id'] ?></td>
-                <td><?= e((string) ($p['payment_type'] ?? '')) ?></td>
-                <td class="text-right"><?= e(format_currency((float) $p['amount'])) ?></td>
-            </tr>
-        <?php endforeach; ?>
-        </tbody>
-    </table>
-    <h2><?= e(__('ledger.ledger_transactions')) ?></h2>
-    <table>
-        <thead><tr><th><?= e(__('common.date')) ?></th><th><?= e(__('ledger.col_desc')) ?></th><th><?= e(__('ledger.col_debit')) ?></th><th><?= e(__('ledger.col_credit')) ?></th><th><?= e(__('ledger.col_balance')) ?></th></tr></thead>
-        <tbody>
-        <?php if (!$ledgerRows): ?><tr><td colspan="5"><?= e(__('ledger.no_ledger_transactions')) ?></td></tr><?php endif; ?>
-        <?php foreach ($ledgerRows as $l): ?>
-            <tr>
-                <td><?= e(format_date_pk((string) $l['entry_date'])) ?></td>
-                <td><?= e((string) ($l['description'] ?? '—')) ?></td>
-                <td class="text-right"><?= e(format_currency((float) $l['debit'])) ?></td>
-                <td class="text-right"><?= e(format_currency((float) $l['credit'])) ?></td>
-                <td class="text-right"><?= e(format_currency((float) $l['balance'])) ?></td>
-            </tr>
-        <?php endforeach; ?>
-        </tbody>
-    </table>
-    <?php
-    $body = (string) ob_get_clean();
-    $renderA4Document('Supplier Ledger Detail', $body);
-    exit;
-}
-
 $customerDetail = null;
 $customerDetailInvoices = [];
 $customerDetailPayments = [];
+$customerDetailOrders = [];
+$customerDetailCylinderRows = [];
 $customerDetailLedger = [];
+$customerLedgerBalance = 0.0;
+$customerAccountSnapshot = [];
+$customerDetailSummary = ['orders' => 0, 'billed' => 0.0, 'paid' => 0.0, 'remaining' => 0.0];
+$ledgerFlashError = trim((string) ($_GET['err'] ?? ''));
 $ledgerScrollToPayment = false;
 $ledgerPreselectInvoiceId = 0;
-if ($entity === 'customer' && $viewCustomerId > 0) {
+if ($viewCustomerId > 0) {
     $st = $pdo->prepare('SELECT id, name, phone, address FROM customers WHERE id = ?');
     $st->execute([$viewCustomerId]);
     $customerDetail = $st->fetch() ?: null;
     if ($customerDetail) {
+        $customerDetailOrders = $loadCustomerOrders($pdo, $viewCustomerId);
+        $customerDetailCylinderRows = $loadCustomerCylinderRows($pdo, $viewCustomerId);
         $st = $pdo->prepare('SELECT id, total_amount, paid_amount, remaining_amount FROM invoices WHERE customer_id = ? ORDER BY id DESC');
         $st->execute([$viewCustomerId]);
         $customerDetailInvoices = $st->fetchAll();
         $st = $pdo->prepare('SELECT p.payment_date, p.amount, p.invoice_id FROM payments p INNER JOIN invoices i ON i.id = p.invoice_id WHERE i.customer_id = ? ORDER BY p.payment_date DESC, p.id DESC');
         $st->execute([$viewCustomerId]);
         $customerDetailPayments = $st->fetchAll();
-        $st = $pdo->prepare('SELECT date, description, debit, credit, balance FROM ledger WHERE customer_id = ? ORDER BY date DESC, id DESC');
+        $ledgerDetailCols = 'date, description, debit, credit, balance';
+        if (column_exists($pdo, 'ledger', 'reference_type')) {
+            $ledgerDetailCols .= ', reference_type';
+        }
+        if (column_exists($pdo, 'ledger', 'cylinders_sent')) {
+            $ledgerDetailCols .= ', cylinders_sent, cylinders_received, cylinders_baqi';
+        }
+        $st = $pdo->prepare("SELECT {$ledgerDetailCols} FROM ledger WHERE customer_id = ? ORDER BY date ASC, id ASC");
         $st->execute([$viewCustomerId]);
         $customerDetailLedger = $st->fetchAll();
+        $customerLedgerBalance = 0.0;
+        if ($customerDetailLedger !== []) {
+            $lastLedgerRow = $customerDetailLedger[count($customerDetailLedger) - 1];
+            $customerLedgerBalance = (float) ($lastLedgerRow['balance'] ?? 0);
+        }
+        $customerAccountSnapshot = customer_account_snapshot($pdo, $viewCustomerId);
+        $customerLedgerBalance = (float) ($customerAccountSnapshot['receivable'] ?? $customerLedgerBalance);
+        $customerDetailSummary['orders'] = count($customerDetailOrders);
+        foreach ($customerDetailOrders as $order) {
+            $customerDetailSummary['billed'] += (float) ($order['grand_total'] ?? 0);
+            $customerDetailSummary['paid'] += (float) ($order['invoice_paid'] ?? 0);
+            $customerDetailSummary['remaining'] += (float) ($order['invoice_remaining'] ?? 0);
+        }
 
         $ledgerScrollToPayment = isset($_GET['focus']) && (string) $_GET['focus'] === 'payment';
         $wantInvoice = (int) ($_GET['pay_invoice'] ?? 0);
@@ -573,40 +616,6 @@ if ($entity === 'customer' && $viewCustomerId > 0) {
                 }
             }
         }
-    }
-}
-
-$supplierDetail = null;
-$supplierDetailTransactions = [];
-$supplierDetailPayments = [];
-$supplierDetailLedger = [];
-if ($entity === 'supplier' && $viewSupplierId > 0) {
-    $st = $pdo->prepare('SELECT id, name, phone, contact_person FROM suppliers WHERE id = ?');
-    $st->execute([$viewSupplierId]);
-    $supplierDetail = $st->fetch() ?: null;
-    if ($supplierDetail) {
-        $st = $pdo->prepare("SELECT t.id, t.transaction_date, t.total_amount, t.paid_amount, t.remaining_amount, t.payment_status,
-            t.sent_qty_small, t.sent_qty_medium, t.sent_qty_large,
-            t.sent_pressure_small, t.sent_pressure_medium, t.sent_pressure_large,
-            (SELECT GROUP_CONCAT(CONCAT(
-                COALESCE(b.refill_cylinder_type, ''),
-                ':',
-                COALESCE(b.quantity, 0),
-                ':',
-                COALESCE(b.pressure_received, 0)
-            ) ORDER BY b.id ASC SEPARATOR '|')
-            FROM supplier_refill_breakdown b WHERE b.transaction_id = t.id) AS refill_breakdown
-            FROM supplier_transactions t
-            WHERE t.supplier_id = ?
-            ORDER BY t.transaction_date DESC, t.id DESC");
-        $st->execute([$viewSupplierId]);
-        $supplierDetailTransactions = $st->fetchAll();
-        $st = $pdo->prepare('SELECT payment_date, amount, transaction_id, payment_type FROM supplier_payments WHERE supplier_id = ? ORDER BY payment_date DESC, id DESC');
-        $st->execute([$viewSupplierId]);
-        $supplierDetailPayments = $st->fetchAll();
-        $st = $pdo->prepare('SELECT entry_date, description, debit, credit, balance FROM supplier_ledger WHERE supplier_id = ? ORDER BY entry_date DESC, id DESC');
-        $st->execute([$viewSupplierId]);
-        $supplierDetailLedger = $st->fetchAll();
     }
 }
 
@@ -633,20 +642,12 @@ ob_start();
     }
 }
 </style>
-<section class="bg-white border border-slate-200 rounded-xl p-4 mb-5 no-print">
-    <div class="flex flex-wrap items-center gap-2">
-        <a href="?module=ledger&entity=customer<?= $customerSearch !== '' ? '&q=' . urlencode($customerSearch) : '' ?><?= i18n_lang_query() ?>" class="px-3 py-2 rounded-lg text-sm <?= $entity === 'customer' ? 'bg-primary text-white' : 'bg-slate-100 text-slate-700' ?>"><?= e(__('ledger.customer_ledger_tab')) ?></a>
-        <a href="?module=ledger&entity=supplier<?= $supplierSearch !== '' ? '&supplier_q=' . urlencode($supplierSearch) : '' ?><?= i18n_lang_query() ?>" class="px-3 py-2 rounded-lg text-sm <?= $entity === 'supplier' ? 'bg-primary text-white' : 'bg-slate-100 text-slate-700' ?>"><?= e(__('ledger.supplier_ledger_tab')) ?></a>
-    </div>
-</section>
-<?php if ($entity === 'customer'): ?>
 <?php if (!$customerDetail): ?>
 <section class="bg-white border border-slate-200 rounded-xl overflow-hidden">
     <div class="p-4 border-b border-slate-200 flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between no-print">
-        <h3 class="font-semibold shrink-0"><?= e(__('ledger.title')) ?> (Customers)</h3>
+        <h3 class="font-semibold shrink-0"><?= e(__('ledger.title')) ?></h3>
         <form method="get" class="flex flex-wrap gap-2 w-full sm:flex-1 sm:max-w-xl sm:ms-auto sm:justify-end">
             <input type="hidden" name="module" value="ledger">
-            <input type="hidden" name="entity" value="customer">
             <?php if (i18n_locale() === 'ps'): ?><input type="hidden" name="lang" value="ps"><?php endif; ?>
             <div class="relative min-w-0 flex-1 sm:min-w-[220px]">
                 <input type="search" id="ledgerSearchField" name="q" value="<?= e($customerSearch) ?>" autocomplete="off" placeholder="<?= e(__('ledger.search_ph')) ?>" class="border rounded-lg px-3 py-2 text-sm w-full">
@@ -702,7 +703,7 @@ ob_start();
                         </span>
                     </td>
                     <td class="p-3 text-end align-middle whitespace-nowrap">
-                        <a href="?module=ledger&entity=customer&view_customer=<?= (int) ($row['customer_id'] ?? 0) ?><?= i18n_lang_query() ?>" class="rounded bg-emerald-100 px-2 py-1 text-xs text-emerald-700"><?= e(__('customers.view')) ?></a>
+                        <a href="?module=ledger&view_customer=<?= (int) ($row['customer_id'] ?? 0) ?><?= i18n_lang_query() ?>" class="rounded bg-emerald-100 px-2 py-1 text-xs text-emerald-700"><?= e(__('customers.view')) ?></a>
                     </td>
                 </tr>
             <?php endforeach; ?>
@@ -712,112 +713,386 @@ ob_start();
     <div class="grid grid-cols-1 md:grid-cols-5 gap-3 p-4 border-t border-slate-200 text-sm">
         <div><span class="text-slate-500"><?= e(__('ledger.total_debit')) ?>:</span> <strong><?= e(format_currency($customerSummary['debit'])) ?></strong></div>
         <div><span class="text-slate-500"><?= e(__('ledger.total_credit')) ?>:</span> <strong><?= e(format_currency($customerSummary['credit'])) ?></strong></div>
-        <div><span class="text-slate-500"><?= e(__('ledger.net_balance')) ?>:</span> <strong class="<?= $customerSummary['balance'] > 0 ? 'text-warning' : 'text-primary' ?>"><?= e(format_currency($customerSummary['balance'])) ?></strong></div>
+        <div><span class="text-slate-500"><?= e(__('ledger.net_receivable')) ?>:</span> <strong class="<?= $customerSummary['balance'] > 0 ? 'text-amber-700' : 'text-emerald-700' ?>"><?= e(format_currency($customerSummary['balance'])) ?></strong></div>
         <div><span class="text-slate-500"><?= e(__('ledger.due_payment')) ?>:</span> <strong><?= e(format_currency($customerSummary['due'])) ?></strong></div>
         <div><span class="text-slate-500"><?= e(__('ledger.remaining_balance')) ?>:</span> <strong><?= e(format_currency($customerSummary['remaining'])) ?></strong></div>
     </div>
 </section>
 <?php endif; ?>
-<?php else: ?>
-<?php if (!$supplierDetail): ?>
-<section class="bg-white border border-slate-200 rounded-xl overflow-hidden">
-    <div class="p-4 border-b border-slate-200 flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between">
-        <h3 class="font-semibold shrink-0"><?= e(__('ledger.supplier_ledger_title')) ?></h3>
-        <form method="get" class="flex flex-wrap gap-2 w-full sm:flex-1 sm:max-w-xl sm:ms-auto sm:justify-end">
-            <input type="hidden" name="module" value="ledger">
-            <input type="hidden" name="entity" value="supplier">
-            <?php if (i18n_locale() === 'ps'): ?><input type="hidden" name="lang" value="ps"><?php endif; ?>
-            <div class="min-w-0 flex-1 sm:min-w-[220px]">
-                <input type="search" name="supplier_q" value="<?= e($supplierSearch) ?>" autocomplete="off" placeholder="Supplier name, phone or contact" class="border rounded-lg px-3 py-2 text-sm w-full">
-            </div>
-            <button type="submit" class="bg-info text-white rounded-lg px-3 py-2 text-sm shrink-0"><?= e(__('common.search')) ?></button>
-        </form>
+<?php if ($customerDetail): ?>
+<section class="mt-5 bg-white border border-slate-200 rounded-xl p-4">
+    <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
+        <h3 class="font-semibold"><?= e(__('ledger.customer_view')) ?>: <?= e((string) $customerDetail['name']) ?></h3>
+        <div class="flex gap-2">
+            <a class="btn btn-soft" href="?module=ledger<?= i18n_lang_query() ?>"><?= e(__('ledger.back_to_list')) ?></a>
+        </div>
     </div>
-    <div class="overflow-x-auto table-wrap">
-        <table data-sortable="true" class="w-full text-sm min-w-[980px]">
+    <?php
+    $paymentsByInvoice = [];
+    foreach ($customerDetailPayments as $payRow) {
+        $invKey = (int) ($payRow['invoice_id'] ?? 0);
+        if (!isset($paymentsByInvoice[$invKey])) {
+            $paymentsByInvoice[$invKey] = [];
+        }
+        $paymentsByInvoice[$invKey][] = $payRow;
+    }
+    ?>
+    <?php
+    $showOpeningBalance = !empty($customerAccountSnapshot['show_opening_balance']);
+    $showOpeningCylinders = !empty($customerAccountSnapshot['show_opening_cylinders']);
+    $receivableTone = $customerLedgerBalance > 0.00001 ? 'text-amber-700' : 'text-emerald-700';
+    ?>
+    <div id="ledgerCustomerHeader" class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 text-sm mb-4">
+        <div><span class="text-slate-500"><?= e(__('customers.label_phone')) ?>:</span> <?= e((string) ($customerDetail['phone'] ?? '')) ?></div>
+        <div><span class="text-slate-500"><?= e(__('ledger.total_orders')) ?>:</span> <strong id="ledgerHdrOrders"><?= (int) $customerDetailSummary['orders'] ?></strong></div>
+        <div id="ledgerHdrOpeningBalance" class="<?= $showOpeningBalance ? '' : 'hidden' ?>">
+            <span class="text-slate-500"><?= e(__('customers.opening_balance')) ?>:</span>
+            <strong id="ledgerHdrOpeningBalanceVal"><?= e(format_currency((float) ($customerAccountSnapshot['opening_balance_remaining'] ?? 0))) ?></strong>
+        </div>
+        <div id="ledgerHdrOpeningCylinders" class="<?= $showOpeningCylinders ? '' : 'hidden' ?>">
+            <span class="text-slate-500"><?= e(__('customers.opening_cylinders')) ?>:</span>
+            <strong id="ledgerHdrOpeningCylindersVal"><?= (int) ($customerAccountSnapshot['opening_cylinders_remaining'] ?? 0) ?></strong>
+        </div>
+        <div>
+            <span class="text-slate-500"><?= e(__('ledger.cylinders_owed_now')) ?>:</span>
+            <strong id="ledgerHdrCylindersOwed" class="text-amber-700"><?= (int) ($customerAccountSnapshot['cylinders_owed'] ?? 0) ?></strong>
+        </div>
+        <div>
+            <span class="text-slate-500"><?= e(__('ledger.invoice_remaining')) ?>:</span>
+            <strong id="ledgerHdrInvoiceRemaining" class="text-amber-700"><?= e(format_currency((float) ($customerAccountSnapshot['invoice_remaining'] ?? 0))) ?></strong>
+        </div>
+        <div class="col-span-2 md:col-span-1">
+            <span class="text-slate-500"><?= e(__('ledger.net_receivable')) ?>:</span>
+            <strong id="ledgerHdrReceivable" class="<?= e($receivableTone) ?>"><?= e(format_currency($customerLedgerBalance)) ?></strong>
+        </div>
+    </div>
+    <p id="ledgerAjaxError" class="hidden mb-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-800" role="alert"></p>
+
+    <h4 class="font-semibold mb-2"><?= e(__('ledger.ledger_transactions')) ?></h4>
+    <div class="overflow-x-auto table-wrap mb-6">
+        <table class="w-full text-sm min-w-[720px]">
             <thead class="bg-slate-50">
             <tr>
-                <th data-sort class="text-start p-3 whitespace-nowrap"><?= e(__('ledger.last_transaction')) ?></th>
-                <th data-sort class="text-start p-3 min-w-[120px]"><?= e(__('suppliers.col_supplier')) ?></th>
-                <th data-sort class="text-start p-3 min-w-[110px]"><?= e(__('suppliers.col_phone')) ?></th>
-                <th class="text-end p-3 whitespace-nowrap"><?= e(__('ledger.due_payment')) ?></th>
-                <th class="text-end p-3 whitespace-nowrap"><?= e(__('common.status')) ?></th>
-                <th class="text-end p-3 whitespace-nowrap"><?= e(__('common.actions')) ?></th>
+                <th class="text-start p-3"><?= e(__('common.date')) ?></th>
+                <th class="text-start p-3"><?= e(__('ledger.col_desc')) ?></th>
+                <?php if (column_exists($pdo, 'ledger', 'cylinders_sent')): ?>
+                <th class="text-start p-3"><?= e(__('ledger.col_cyl')) ?></th>
+                <?php endif; ?>
+                <th class="text-end p-3"><?= e(__('ledger.col_debit')) ?></th>
+                <th class="text-end p-3"><?= e(__('ledger.col_credit')) ?></th>
+                <th class="text-end p-3"><?= e(__('ledger.col_balance')) ?></th>
             </tr>
             </thead>
-            <tbody>
-            <?php if ($supplierSearch === '' && $matchedSupplierCount === 0): ?>
-                <tr><td colspan="6" class="p-4 text-slate-500"><?= e(__('ledger.no_supplier_records')) ?></td></tr>
-            <?php elseif ($matchedSupplierCount === 0): ?>
-                <tr><td colspan="6" class="p-4 text-slate-500"><?= e(__('ledger.no_supplier_match')) ?></td></tr>
-            <?php elseif (!$supplierLedgerRows): ?>
-                <tr><td colspan="6" class="p-4 text-slate-500"><?= e(__('ledger.no_supplier_refill_data')) ?></td></tr>
+            <tbody id="ledgerCustomerLedgerBody">
+            <?php if (!$customerDetailLedger): ?>
+                <tr><td colspan="<?= column_exists($pdo, 'ledger', 'cylinders_sent') ? 6 : 5 ?>" class="p-3 text-slate-500"><?= e(__('ledger.no_ledger_transactions')) ?></td></tr>
             <?php endif; ?>
-            <?php foreach ($supplierLedgerRows as $row): $due = $supplierDueMap[(int) ($row['supplier_id'] ?? 0)] ?? ['due_payment' => (float) ($row['total_due'] ?? 0), 'remaining_balance' => (float) ($row['remaining_balance'] ?? 0)]; ?>
-                <tr data-row="true" class="border-t border-slate-100">
-                    <td class="p-3 text-start align-middle whitespace-nowrap"><?= e(($row['last_transaction_date'] ?? '') !== '' ? format_date_pk((string) $row['last_transaction_date']) : '-') ?></td>
-                    <td class="p-3 text-start align-middle"><?= e((string) ($row['supplier_name'] ?? '')) ?></td>
-                    <td class="p-3 text-start align-middle tabular-nums"><?= e((string) ($row['supplier_phone'] ?? '')) ?></td>
-                    <td class="p-3 text-end align-middle tabular-nums"><?= e(format_currency((float) $due['due_payment'])) ?></td>
-                    <td class="p-3 text-end align-middle tabular-nums">
-                        <span class="<?= (float) $due['remaining_balance'] > 0 ? 'text-amber-600 font-semibold' : 'text-emerald-600 font-semibold' ?>">
-                            <?= (float) $due['remaining_balance'] > 0 ? e(__('status.due')) . ' ' . e(format_currency((float) $due['remaining_balance'])) : e(__('status.paid')) ?>
-                        </span>
-                    </td>
-                    <td class="p-3 text-end align-middle whitespace-nowrap">
-                        <a href="?module=ledger&entity=supplier&view_supplier=<?= (int) ($row['supplier_id'] ?? 0) ?><?= i18n_lang_query() ?>" class="rounded bg-emerald-100 px-2 py-1 text-xs text-emerald-700"><?= e(__('customers.view')) ?></a>
-                    </td>
+            <?php foreach ($customerDetailLedger as $ledgerRow): ?>
+                <?php $refType = (string) ($ledgerRow['reference_type'] ?? ''); ?>
+                <tr class="border-t border-slate-100<?= in_array($refType, ['opening_balance', 'cylinder_settlement'], true) ? ' bg-sky-50/60' : '' ?>">
+                    <td class="p-3 whitespace-nowrap"><?= e(format_date_pk((string) $ledgerRow['date'])) ?></td>
+                    <td class="p-3"><?= e(trim((string) ($ledgerRow['description'] ?? '')) !== '' ? trim((string) $ledgerRow['description']) : (string) __('common.none')) ?></td>
+                    <?php if (column_exists($pdo, 'ledger', 'cylinders_sent')): ?>
+                    <td class="p-3 tabular-nums"><?= e((string) (($ledgerRow['cylinders_sent'] ?? 0) . '/' . ($ledgerRow['cylinders_received'] ?? 0) . '/' . ($ledgerRow['cylinders_baqi'] ?? 0))) ?></td>
+                    <?php endif; ?>
+                    <td class="p-3 text-end tabular-nums"><?= e(format_currency((float) ($ledgerRow['debit'] ?? 0))) ?></td>
+                    <td class="p-3 text-end tabular-nums"><?= e(format_currency((float) ($ledgerRow['credit'] ?? 0))) ?></td>
+                    <td class="p-3 text-end tabular-nums font-medium"><?= e(format_currency((float) ($ledgerRow['balance'] ?? 0))) ?></td>
                 </tr>
             <?php endforeach; ?>
             </tbody>
         </table>
     </div>
-    <div class="grid grid-cols-1 md:grid-cols-5 gap-3 p-4 border-t border-slate-200 text-sm">
-        <div><span class="text-slate-500"><?= e(__('ledger.total_debit')) ?>:</span> <strong><?= e(format_currency($supplierSummary['debit'])) ?></strong></div>
-        <div><span class="text-slate-500"><?= e(__('ledger.total_credit')) ?>:</span> <strong><?= e(format_currency($supplierSummary['credit'])) ?></strong></div>
-        <div><span class="text-slate-500"><?= e(__('ledger.net_balance')) ?>:</span> <strong class="<?= $supplierSummary['balance'] > 0 ? 'text-warning' : 'text-primary' ?>"><?= e(format_currency($supplierSummary['balance'])) ?></strong></div>
-        <div><span class="text-slate-500"><?= e(__('ledger.due_payment')) ?>:</span> <strong><?= e(format_currency($supplierSummary['due'])) ?></strong></div>
-        <div><span class="text-slate-500"><?= e(__('ledger.remaining_balance')) ?>:</span> <strong><?= e(format_currency($supplierSummary['remaining'])) ?></strong></div>
-    </div>
-</section>
-<?php endif; ?>
-<?php endif; ?>
-<?php if ($entity === 'customer' && $customerDetail): ?>
-<section class="mt-5 bg-white border border-slate-200 rounded-xl p-4">
-    <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
-        <h3 class="font-semibold"><?= e(__('ledger.customer_view')) ?>: <?= e((string) $customerDetail['name']) ?></h3>
-        <div class="flex gap-2">
-            <a class="btn btn-soft" href="?module=ledger&entity=customer<?= i18n_lang_query() ?>"><?= e(__('ledger.back_to_list')) ?></a>
+
+    <?php if ($ledgerFlashError !== ''): ?>
+        <p class="mb-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-800"><?= e($ledgerFlashError) ?></p>
+    <?php endif; ?>
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-4">
+        <div id="ledgerCustomerPayment" class="border rounded-lg p-3">
+            <h4 class="font-semibold mb-1"><?= e(__('ledger.receive_payment')) ?></h4>
+            <p class="text-xs text-slate-500 mb-2"><?= e(__('ledger.receive_payment_hint')) ?></p>
+            <form method="post" class="ledger-ajax-form grid grid-cols-1 sm:grid-cols-2 gap-2">
+                <?php if (i18n_locale() === 'ps'): ?><input type="hidden" name="lang" value="ps"><?php endif; ?>
+                <input type="hidden" name="action" value="add_customer_receive_payment">
+                <input type="hidden" name="customer_id" value="<?= (int) $customerDetail['id'] ?>">
+                <input type="number" id="ledgerReceivePaymentAmount" name="amount" step="0.01" min="0.01"<?= $customerLedgerBalance > 0 ? ' max="' . e((string) $customerLedgerBalance) . '"' : '' ?> required class="border rounded-lg px-3 py-2 text-sm sm:col-span-2" placeholder="<?= e(__('payments.amount')) ?>">
+                <input type="date" name="payment_date" value="<?= date('Y-m-d') ?>" class="border rounded-lg px-3 py-2 text-sm">
+                <input type="text" name="payment_note" class="border rounded-lg px-3 py-2 text-sm" placeholder="<?= e(__('ledger.payment_note_ph')) ?>">
+                <button class="bg-primary text-white rounded-lg px-3 py-2 text-sm sm:col-span-2"><?= e(__('ledger.receive_payment_btn')) ?></button>
+            </form>
+        </div>
+        <div class="border rounded-lg p-3">
+            <h4 class="font-semibold mb-1"><?= e(__('ledger.pay_against_invoice')) ?></h4>
+            <p class="text-xs text-slate-500 mb-2"><?= e(__('ledger.pay_against_invoice_hint')) ?></p>
+            <form method="post" class="ledger-ajax-form grid grid-cols-1 sm:grid-cols-2 gap-2">
+                <?php if (i18n_locale() === 'ps'): ?><input type="hidden" name="lang" value="ps"><?php endif; ?>
+                <input type="hidden" name="action" value="add_customer_due_payment">
+                <input type="hidden" name="customer_id" value="<?= (int) $customerDetail['id'] ?>">
+                <select id="ledgerInvoiceSelect" name="invoice_id" class="border rounded-lg px-3 py-2 text-sm sm:col-span-2" required>
+                    <option value=""><?= e(__('ledger.select_due_invoice')) ?></option>
+                    <?php foreach ($customerDetailInvoices as $inv): if ((float) ($inv['remaining_amount'] ?? 0) <= 0.00001) continue; ?>
+                        <option value="<?= (int) $inv['id'] ?>"<?= $ledgerPreselectInvoiceId === (int) $inv['id'] ? ' selected' : '' ?>>INV-<?= (int) $inv['id'] ?> (<?= e(__('status.due')) ?>: <?= e(format_currency((float) $inv['remaining_amount'])) ?>)</option>
+                    <?php endforeach; ?>
+                </select>
+                <input type="number" name="amount" step="0.01" min="0.01" required class="border rounded-lg px-3 py-2 text-sm" placeholder="<?= e(__('payments.amount')) ?>">
+                <input type="date" name="payment_date" value="<?= date('Y-m-d') ?>" class="border rounded-lg px-3 py-2 text-sm">
+                <button class="bg-slate-800 text-white rounded-lg px-3 py-2 text-sm sm:col-span-2"><?= e(__('payments.save')) ?></button>
+            </form>
         </div>
     </div>
-    <div class="grid grid-cols-1 md:grid-cols-3 gap-3 text-sm mb-4">
-        <div><span class="text-slate-500"><?= e(__('customers.label_phone')) ?>:</span> <?= e((string) ($customerDetail['phone'] ?? '')) ?></div>
-        <div><span class="text-slate-500"><?= e(__('customers.label_address')) ?>:</span> <?= e((string) ($customerDetail['address'] ?? '')) ?></div>
-        <div><span class="text-slate-500"><?= e(__('ledger.total_invoices')) ?>:</span> <?= count($customerDetailInvoices) ?></div>
-    </div>
-    <div id="ledgerCustomerPayment" class="border rounded-lg p-3 mb-4">
-        <h4 class="font-semibold mb-2"><?= e(__('ledger.add_due_payment')) ?></h4>
-        <form method="post" class="grid grid-cols-1 md:grid-cols-5 gap-2">
+    <div class="border rounded-lg p-3 mb-4">
+        <h4 class="font-semibold mb-1"><?= e(__('ledger.record_cylinder_return')) ?></h4>
+        <p class="text-xs text-slate-500 mb-2"><?= e(__('ledger.record_cylinder_return_hint')) ?></p>
+        <form method="post" class="ledger-ajax-form grid grid-cols-1 sm:grid-cols-4 gap-2">
             <?php if (i18n_locale() === 'ps'): ?><input type="hidden" name="lang" value="ps"><?php endif; ?>
-            <input type="hidden" name="action" value="add_customer_due_payment">
+            <input type="hidden" name="action" value="add_customer_cylinder_return">
             <input type="hidden" name="customer_id" value="<?= (int) $customerDetail['id'] ?>">
-            <select name="invoice_id" class="border rounded-lg px-3 py-2 text-sm" required>
-                <option value=""><?= e(__('ledger.select_due_invoice')) ?></option>
-                <?php foreach ($customerDetailInvoices as $inv): if ((float) ($inv['remaining_amount'] ?? 0) <= 0.00001) continue; ?>
-                    <option value="<?= (int) $inv['id'] ?>"<?= $ledgerPreselectInvoiceId === (int) $inv['id'] ? ' selected' : '' ?>>INV-<?= (int) $inv['id'] ?> (<?= e(__('status.due')) ?>: <?= e(format_currency((float) $inv['remaining_amount'])) ?>)</option>
-                <?php endforeach; ?>
-            </select>
-            <input type="number" name="amount" step="0.01" min="0.01" required class="border rounded-lg px-3 py-2 text-sm" placeholder="<?= e(__('payments.amount')) ?>">
-            <input type="date" name="payment_date" value="<?= date('Y-m-d') ?>" class="border rounded-lg px-3 py-2 text-sm">
-            <button class="bg-primary text-white rounded-lg px-3 py-2 text-sm"><?= e(__('payments.save')) ?></button>
+            <input type="number" id="ledgerCylinderReturnQty" name="cylinders_returned" step="1" min="1"<?= (int) ($customerAccountSnapshot['cylinders_owed'] ?? 0) > 0 ? ' max="' . (int) $customerAccountSnapshot['cylinders_owed'] . '"' : '' ?> required class="border rounded-lg px-3 py-2 text-sm" placeholder="<?= e(__('ledger.cylinders_returned_ph')) ?>">
+            <input type="date" name="return_date" value="<?= date('Y-m-d') ?>" class="border rounded-lg px-3 py-2 text-sm">
+            <input type="text" name="return_note" class="border rounded-lg px-3 py-2 text-sm sm:col-span-2" placeholder="<?= e(__('ledger.return_note_ph')) ?>">
+            <button class="bg-sky-700 text-white rounded-lg px-3 py-2 text-sm"><?= e(__('ledger.record_cylinder_return_btn')) ?></button>
         </form>
     </div>
-    <div class="grid grid-cols-1 xl:grid-cols-3 gap-4">
-        <div class="border rounded-lg p-3"><h4 class="font-semibold mb-2"><?= e(__('ledger.invoices')) ?></h4><?php foreach ($customerDetailInvoices as $inv): ?><p class="text-sm mb-1">INV-<?= (int) $inv['id'] ?> | <?= e(__('common.total')) ?> <?= e(format_currency((float) $inv['total_amount'])) ?> | <?= e(__('common.remaining')) ?> <?= e(format_currency((float) $inv['remaining_amount'])) ?></p><?php endforeach; ?><?php if (!$customerDetailInvoices): ?><p class="text-sm text-slate-500"><?= e(__('ledger.no_invoices')) ?></p><?php endif; ?></div>
-        <div class="border rounded-lg p-3"><h4 class="font-semibold mb-2"><?= e(__('ledger.payments')) ?></h4><?php foreach ($customerDetailPayments as $p): ?><p class="text-sm mb-1"><?= e(format_date_pk((string) $p['payment_date'])) ?> | INV-<?= (int) $p['invoice_id'] ?> | <?= e(format_currency((float) $p['amount'])) ?></p><?php endforeach; ?><?php if (!$customerDetailPayments): ?><p class="text-sm text-slate-500"><?= e(__('ledger.no_payments')) ?></p><?php endif; ?></div>
-        <div class="border rounded-lg p-3"><h4 class="font-semibold mb-2"><?= e(__('ledger.ledger_transactions')) ?></h4><?php foreach ($customerDetailLedger as $l): ?><p class="text-sm mb-1"><?= e(format_date_pk((string) $l['date'])) ?> | D <?= e(format_currency((float) $l['debit'])) ?> | C <?= e(format_currency((float) $l['credit'])) ?> | B <?= e(format_currency((float) $l['balance'])) ?></p><?php endforeach; ?><?php if (!$customerDetailLedger): ?><p class="text-sm text-slate-500"><?= e(__('ledger.no_ledger_transactions')) ?></p><?php endif; ?></div>
+
+    <h4 class="font-semibold mb-3"><?= e(__('ledger.order_history')) ?></h4>
+    <div class="space-y-4">
+        <?php foreach ($customerDetailOrders as $order): ?>
+            <?php
+            $serviceId = (int) ($order['service_id'] ?? 0);
+            $invoiceId = (int) ($order['invoice_id'] ?? 0);
+            $serviceCharges = (float) ($order['service_charges'] ?? 0);
+            $totalBill = (float) ($order['total_bill'] ?? 0);
+            $gasTotal = max(0, $totalBill - $serviceCharges);
+            $paid = (float) ($order['invoice_paid'] ?? 0);
+            $remaining = (float) ($order['invoice_remaining'] ?? 0);
+            $status = payment_status_from_amounts((float) ($order['invoice_total'] ?? 0), $paid);
+            $orderPayments = $paymentsByInvoice[$invoiceId] ?? [];
+            $cylinderLines = $customerDetailCylinderRows[$serviceId] ?? [];
+            $orderDescription = trim((string) ($order['notes'] ?? ''));
+            ?>
+            <div class="border rounded-lg p-3 sm:p-4" data-ledger-order-id="<?= $serviceId ?>">
+                <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
+                    <h5 class="font-semibold text-slate-900"><?= e(__('ledger.order_ref')) ?> ORD-<?= $serviceId ?> · <?= e(format_date_pk((string) $order['date'])) ?></h5>
+                    <span data-ledger-order-status class="px-2 py-1 rounded-full text-xs <?= $status === 'Paid' ? 'status-paid' : ($status === 'Partial' ? 'status-partial' : 'status-due') ?>"><?= e(payment_status_label($status)) ?></span>
+                </div>
+                <p class="text-sm text-slate-600 mb-3">
+                    <span class="font-medium text-slate-700"><?= e(__('ledger.col_desc')) ?>:</span>
+                    <?= e($orderDescription !== '' ? $orderDescription : (string) __('common.none')) ?>
+                </p>
+                <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 text-sm">
+                    <div>
+                        <p class="font-medium mb-2 text-slate-800"><?= e(__('ledger.cylinder_lines')) ?></p>
+                        <div class="grid grid-cols-3 gap-2 mb-2 text-center">
+                            <div class="rounded-lg bg-slate-50 p-2">
+                                <p class="text-[11px] text-slate-500"><?= e(__('ledger.daka')) ?></p>
+                                <p class="text-lg font-semibold"><?= (int) ($order['cylinders_sent'] ?? 0) ?></p>
+                            </div>
+                            <div class="rounded-lg bg-emerald-50 p-2">
+                                <p class="text-[11px] text-emerald-800"><?= e(__('ledger.tash')) ?></p>
+                                <p class="text-lg font-semibold text-emerald-900"><?= (int) ($order['cylinders_received'] ?? 0) ?></p>
+                            </div>
+                            <div class="rounded-lg bg-sky-50 p-2">
+                                <p class="text-[11px] text-sky-800"><?= e(__('ledger.baqi')) ?></p>
+                                <p class="text-lg font-semibold text-sky-900"><?= (int) ($order['cylinders_baqi'] ?? 0) ?></p>
+                            </div>
+                        </div>
+                        <?php if ($cylinderLines): ?>
+                            <ul class="text-xs text-slate-600 space-y-1">
+                            <?php foreach ($cylinderLines as $line): ?>
+                                <li><?= e(__('ledger.daka')) ?> <?= (int) ($line['sent_qty'] ?? 0) ?>, <?= e(__('ledger.tash')) ?> <?= (int) ($line['received_qty'] ?? 0) ?><?php if ((float) ($line['total_amount'] ?? 0) > 0): ?> · <?= e(format_currency((float) $line['total_amount'])) ?><?php endif; ?></li>
+                            <?php endforeach; ?>
+                            </ul>
+                        <?php endif; ?>
+                    </div>
+                    <div>
+                        <p class="font-medium mb-2 text-slate-800"><?= e(__('ledger.bill_summary')) ?></p>
+                        <p class="text-slate-700 mb-1"><span class="text-slate-500"><?= e(__('ledger.gas_total')) ?>:</span> <?= e(format_currency($gasTotal)) ?></p>
+                        <p class="text-slate-700 mb-1"><span class="text-slate-500"><?= e(__('ledger.service_charges')) ?>:</span> <?= e(format_currency($serviceCharges)) ?></p>
+                        <p class="text-slate-700 mb-1"><span class="text-slate-500"><?= e(__('ledger.previous_balance')) ?>:</span> <?= e(format_currency((float) ($order['previous_balance'] ?? 0))) ?></p>
+                        <p class="text-slate-700 mb-1"><span class="text-slate-500"><?= e(__('ledger.grand_total')) ?>:</span> <strong><?= e(format_currency((float) ($order['grand_total'] ?? 0))) ?></strong></p>
+                        <p class="text-slate-700 mb-1"><span class="text-slate-500"><?= e(__('ledger.paid_on_order')) ?>:</span> <span data-ledger-order-paid><?= e(format_currency($paid)) ?></span></p>
+                        <p class="text-slate-700"><span class="text-slate-500"><?= e(__('common.remaining')) ?>:</span> <span data-ledger-order-remaining class="<?= $remaining > 0 ? 'text-amber-600 font-semibold' : 'text-emerald-600 font-semibold' ?>"><?= e(format_currency($remaining)) ?></span></p>
+                        <?php if ($invoiceId > 0): ?>
+                            <p class="text-xs text-slate-500 mt-1">INV-<?= $invoiceId ?></p>
+                        <?php endif; ?>
+                    </div>
+                    <div>
+                        <p class="font-medium mb-2 text-slate-800"><?= e(__('ledger.payments_on_bill')) ?></p>
+                        <?php if (!$orderPayments): ?>
+                            <p class="text-slate-500"><?= e(__('ledger.no_payments_yet')) ?></p>
+                        <?php else: foreach ($orderPayments as $paymentRow): ?>
+                            <p class="mb-1"><?= e(format_date_pk((string) $paymentRow['payment_date'])) ?> · <?= e(format_currency((float) $paymentRow['amount'])) ?></p>
+                        <?php endforeach; endif; ?>
+                    </div>
+                </div>
+            </div>
+        <?php endforeach; ?>
+        <?php if (!$customerDetailOrders): ?>
+            <p class="text-sm text-slate-500"><?= e(__('ledger.no_orders')) ?></p>
+        <?php endif; ?>
     </div>
 </section>
+<script>
+(() => {
+    const errEl = document.getElementById('ledgerAjaxError');
+    const noLedgerTx = <?= json_encode(__('ledger.no_ledger_transactions'), JSON_UNESCAPED_UNICODE) ?>;
+    const selectInvoicePh = <?= json_encode(__('ledger.select_due_invoice'), JSON_UNESCAPED_UNICODE) ?>;
+    const toneClass = (tone) => (tone === 'amber' ? 'text-amber-700' : 'text-emerald-700');
+
+    const notifyFinance = (customerId) => {
+        const payload = { type: 'payment', customerId: Number(customerId || 0), at: Date.now() };
+        if (window.OxygenFinance?.notify) {
+            window.OxygenFinance.notify(payload);
+        }
+    };
+
+    const renderLedgerRows = (detail) => {
+        const tbody = document.getElementById('ledgerCustomerLedgerBody');
+        if (!tbody || !detail) return;
+        const rows = Array.isArray(detail.ledger_rows) ? detail.ledger_rows : [];
+        const colspan = Number(detail.ledger_colspan || 5);
+        const hasCyl = !!detail.ledger_has_cyl;
+        if (!rows.length) {
+            tbody.innerHTML = `<tr><td colspan="${colspan}" class="p-3 text-slate-500">${noLedgerTx}</td></tr>`;
+            return;
+        }
+        tbody.innerHTML = rows.map((row) => {
+            const hi = row.highlight ? ' bg-sky-50/60' : '';
+            const cyl = hasCyl ? `<td class="p-3 tabular-nums">${row.cylinders || ''}</td>` : '';
+            return `<tr class="border-t border-slate-100${hi}">
+                <td class="p-3 whitespace-nowrap">${row.date || ''}</td>
+                <td class="p-3">${row.description || ''}</td>
+                ${cyl}
+                <td class="p-3 text-end tabular-nums">${row.debit || ''}</td>
+                <td class="p-3 text-end tabular-nums">${row.credit || ''}</td>
+                <td class="p-3 text-end tabular-nums font-medium">${row.balance || ''}</td>
+            </tr>`;
+        }).join('');
+    };
+
+    const renderInvoiceSelect = (detail) => {
+        const sel = document.getElementById('ledgerInvoiceSelect');
+        if (!sel || !detail) return;
+        const current = sel.value;
+        const invoices = Array.isArray(detail.invoices) ? detail.invoices : [];
+        sel.innerHTML = `<option value="">${selectInvoicePh}</option>` + invoices.map((inv) =>
+            `<option value="${inv.id}">${inv.label}</option>`
+        ).join('');
+        if (current && [...sel.options].some((o) => o.value === current)) {
+            sel.value = current;
+        }
+    };
+
+    const applyOrders = (detail) => {
+        const orders = Array.isArray(detail?.orders) ? detail.orders : [];
+        orders.forEach((o) => {
+            const card = document.querySelector(`[data-ledger-order-id="${o.service_id}"]`);
+            if (!card) return;
+            const statusEl = card.querySelector('[data-ledger-order-status]');
+            if (statusEl) {
+                statusEl.textContent = o.status_label || '';
+                statusEl.className = `px-2 py-1 rounded-full text-xs ${o.status_class || 'status-due'}`;
+            }
+            const paidEl = card.querySelector('[data-ledger-order-paid]');
+            if (paidEl) paidEl.textContent = o.paid_formatted || '';
+            const remEl = card.querySelector('[data-ledger-order-remaining]');
+            if (remEl) {
+                remEl.textContent = o.remaining_formatted || '';
+                remEl.classList.remove('text-amber-600', 'text-emerald-600', 'font-semibold');
+                remEl.classList.add((Number(o.remaining_raw || 0) > 0 ? 'text-amber-600' : 'text-emerald-600'), 'font-semibold');
+            }
+        });
+    };
+
+    const applyCustomerDetail = (detail) => {
+        if (!detail?.ok) return;
+        applySnapshot(detail.snapshot);
+        renderLedgerRows(detail);
+        renderInvoiceSelect(detail);
+        applyOrders(detail);
+    };
+
+    const applySnapshot = (snap) => {
+        if (!snap) return;
+        const obCard = document.getElementById('ledgerHdrOpeningBalance');
+        const ocCard = document.getElementById('ledgerHdrOpeningCylinders');
+        const obVal = document.getElementById('ledgerHdrOpeningBalanceVal');
+        const ocVal = document.getElementById('ledgerHdrOpeningCylindersVal');
+        const cylOwed = document.getElementById('ledgerHdrCylindersOwed');
+        const invRem = document.getElementById('ledgerHdrInvoiceRemaining');
+        const receivable = document.getElementById('ledgerHdrReceivable');
+        if (obCard) obCard.classList.toggle('hidden', !snap.show_opening_balance);
+        if (ocCard) ocCard.classList.toggle('hidden', !snap.show_opening_cylinders);
+        if (obVal) obVal.textContent = snap.opening_balance_remaining_formatted || '';
+        if (ocVal) ocVal.textContent = String(snap.opening_cylinders_remaining ?? 0);
+        if (cylOwed) cylOwed.textContent = String(snap.cylinders_owed ?? 0);
+        if (invRem) invRem.textContent = snap.invoice_remaining_formatted || '';
+        if (receivable) {
+            receivable.textContent = snap.receivable_formatted || '';
+            receivable.classList.remove('text-amber-700', 'text-emerald-700');
+            receivable.classList.add(toneClass(snap.receivable_tone || 'emerald'));
+        }
+        const payAmt = document.getElementById('ledgerReceivePaymentAmount');
+        const rec = Number(snap.receivable ?? 0);
+        if (payAmt instanceof HTMLInputElement) {
+            if (rec > 0.00001) {
+                payAmt.max = String(rec);
+            } else {
+                payAmt.removeAttribute('max');
+            }
+            payAmt.value = '';
+        }
+        const cylInput = document.getElementById('ledgerCylinderReturnQty');
+        const owed = Number(snap.cylinders_owed ?? 0);
+        if (cylInput instanceof HTMLInputElement) {
+            if (owed > 0) {
+                cylInput.max = String(owed);
+            } else {
+                cylInput.removeAttribute('max');
+            }
+            cylInput.value = '';
+        }
+    };
+
+    document.querySelectorAll('.ledger-ajax-form').forEach((form) => {
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            if (errEl) {
+                errEl.classList.add('hidden');
+                errEl.textContent = '';
+            }
+            const fd = new FormData(form);
+            try {
+                const res = await fetch(window.location.href, {
+                    method: 'POST',
+                    body: fd,
+                    headers: { 'X-Requested-With': 'XMLHttpRequest' },
+                });
+                const data = await res.json();
+                if (!data.ok) {
+                    throw new Error(data.message || 'Request failed');
+                }
+                applyCustomerDetail(data.detail);
+                if (!data.detail?.ok && data.snapshot) {
+                    applySnapshot(data.snapshot);
+                }
+                const customerId = Number(fd.get('customer_id') || 0);
+                notifyFinance(customerId);
+                form.reset();
+                const dateInput = form.querySelector('input[type="date"]');
+                if (dateInput instanceof HTMLInputElement && !dateInput.value) {
+                    dateInput.value = new Date().toISOString().slice(0, 10);
+                }
+            } catch (err) {
+                if (errEl) {
+                    errEl.textContent = err instanceof Error ? err.message : String(err);
+                    errEl.classList.remove('hidden');
+                }
+            }
+        });
+    });
+})();
+</script>
 <?php if ($ledgerScrollToPayment): ?>
 <script>
 (() => {
@@ -834,128 +1109,6 @@ ob_start();
 <?php endif; ?>
 <?php endif; ?>
 
-<?php if ($entity === 'supplier' && $supplierDetail): ?>
-<section class="mt-5 bg-white border border-slate-200 rounded-xl p-4">
-    <?php
-    $paymentsByTx = [];
-    foreach ($supplierDetailPayments as $payRow) {
-        $txKey = (int) ($payRow['transaction_id'] ?? 0);
-        if (!isset($paymentsByTx[$txKey])) {
-            $paymentsByTx[$txKey] = [];
-        }
-        $paymentsByTx[$txKey][] = $payRow;
-    }
-    ?>
-    <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
-        <h3 class="font-semibold"><?= e(__('ledger.supplier_view')) ?>: <?= e((string) $supplierDetail['name']) ?></h3>
-        <div class="flex gap-2">
-            <a class="btn btn-soft" href="?module=ledger&entity=supplier<?= i18n_lang_query() ?>"><?= e(__('ledger.back_to_list')) ?></a>
-            <button type="button" class="btn btn-primary" data-open-modal="supplierDuePaymentModal"><?= e(__('ledger.add_payment')) ?></button>
-        </div>
-    </div>
-    <div class="grid grid-cols-1 md:grid-cols-3 gap-3 text-sm mb-4">
-        <div><span class="text-slate-500"><?= e(__('customers.label_phone')) ?>:</span> <?= e((string) ($supplierDetail['phone'] ?? '')) ?></div>
-        <div><span class="text-slate-500"><?= e(__('suppliers.col_contact')) ?>:</span> <?= e((string) ($supplierDetail['contact_person'] ?? '')) ?></div>
-        <div><span class="text-slate-500"><?= e(__('ledger.total_transactions')) ?>:</span> <?= count($supplierDetailTransactions) ?></div>
-    </div>
-    <div class="space-y-4">
-        <?php foreach ($supplierDetailTransactions as $tx): ?>
-            <?php
-            $txId = (int) ($tx['id'] ?? 0);
-            $sentParts = [];
-            $sentData = [
-                ['label' => 'Small', 'qty' => (int) ($tx['sent_qty_small'] ?? 0), 'psi' => (float) ($tx['sent_pressure_small'] ?? 0)],
-                ['label' => 'Medium', 'qty' => (int) ($tx['sent_qty_medium'] ?? 0), 'psi' => (float) ($tx['sent_pressure_medium'] ?? 0)],
-                ['label' => 'Large', 'qty' => (int) ($tx['sent_qty_large'] ?? 0), 'psi' => (float) ($tx['sent_pressure_large'] ?? 0)],
-            ];
-            foreach ($sentData as $s) {
-                if ($s['qty'] <= 0) continue;
-                $sentParts[] = $s['label'] . ' ' . $s['qty'] . ' (' . number_format($s['psi'], 0) . ' PSI)';
-            }
-            $recvParts = [];
-            foreach (explode('|', (string) ($tx['refill_breakdown'] ?? '')) as $chunk) {
-                if ($chunk === '') continue;
-                [$sz, $q, $p] = array_pad(explode(':', $chunk), 3, '0');
-                $qv = (float) $q;
-                if ($qv <= 0) continue;
-                $recvParts[] = trim((string) $sz) . ' ' . rtrim(rtrim(number_format($qv, 2, '.', ''), '0'), '.') . ' (' . number_format((float) $p, 0) . ' PSI)';
-            }
-            $txPayments = $paymentsByTx[$txId] ?? [];
-            $paidTotal = 0.0;
-            foreach ($txPayments as $paymentRow) {
-                $paidTotal += (float) ($paymentRow['amount'] ?? 0);
-            }
-            $remaining = (float) ($tx['remaining_amount'] ?? 0);
-            $status = $remaining <= 0.00001 ? 'Paid' : ($paidTotal > 0 ? 'Partial' : 'Due');
-            ?>
-            <div class="border rounded-lg p-3">
-                <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
-                    <h4 class="font-semibold"><?= e(__('ledger.bill')) ?> SP-<?= $txId ?> (<?= e((string) $tx['transaction_date']) ?>)</h4>
-                    <span class="px-2 py-1 rounded-full text-xs <?= $status === 'Paid' ? 'status-paid' : ($status === 'Partial' ? 'status-partial' : 'status-due') ?>"><?= e($status) ?></span>
-                </div>
-                <div class="grid grid-cols-1 xl:grid-cols-3 gap-3 text-sm">
-                    <div>
-                        <p class="font-medium mb-1"><?= e(__('ledger.purchased_breakdown')) ?></p>
-                        <p class="text-slate-700 mb-1"><span class="text-slate-500"><?= e(__('ledger.sent')) ?>:</span> <?= e($sentParts ? implode(' | ', $sentParts) : '—') ?></p>
-                        <p class="text-slate-700"><span class="text-slate-500"><?= e(__('ledger.received')) ?>:</span> <?= e($recvParts ? implode(' | ', $recvParts) : '—') ?></p>
-                    </div>
-                    <div>
-                        <p class="font-medium mb-1"><?= e(__('ledger.bill_summary')) ?></p>
-                        <p class="text-slate-700 mb-1"><span class="text-slate-500"><?= e(__('common.total')) ?>:</span> <?= e(format_currency((float) $tx['total_amount'])) ?></p>
-                        <p class="text-slate-700 mb-1"><span class="text-slate-500"><?= e(__('common.paid')) ?>:</span> <?= e(format_currency($paidTotal)) ?></p>
-                        <p class="text-slate-700"><span class="text-slate-500"><?= e(__('common.remaining')) ?>:</span> <span class="<?= $remaining > 0 ? 'text-amber-600 font-semibold' : 'text-emerald-600 font-semibold' ?>"><?= e(format_currency($remaining)) ?></span></p>
-                    </div>
-                    <div>
-                        <p class="font-medium mb-1"><?= e(__('ledger.payments_on_bill')) ?></p>
-                        <?php if (!$txPayments): ?>
-                            <p class="text-slate-500"><?= e(__('ledger.no_payments_yet')) ?></p>
-                        <?php else: foreach ($txPayments as $paymentRow): ?>
-                            <p class="mb-1"><?= e((string) $paymentRow['payment_date']) ?> | <?= e(format_currency((float) $paymentRow['amount'])) ?> (<?= e((string) $paymentRow['payment_type']) ?>)</p>
-                        <?php endforeach; endif; ?>
-                    </div>
-                </div>
-            </div>
-        <?php endforeach; ?>
-        <?php if (!$supplierDetailTransactions): ?><p class="text-sm text-slate-500"><?= e(__('ledger.no_transactions')) ?></p><?php endif; ?>
-    </div>
-    <div class="border rounded-lg p-3 mt-4">
-        <h4 class="font-semibold mb-2"><?= e(__('ledger.ledger_transactions')) ?></h4>
-        <?php foreach ($supplierDetailLedger as $l): ?>
-            <?php $entryType = (float) ($l['debit'] ?? 0) > 0 ? __('ledger.stock_purchase') : ((float) ($l['credit'] ?? 0) > 0 ? __('ledger.payment_received') : __('common.entry')); ?>
-            <p class="text-sm mb-1"><?= e(format_date_pk((string) $l['entry_date'])) ?> | <?= e($entryType) ?> | D <?= e(format_currency((float) $l['debit'])) ?> | C <?= e(format_currency((float) $l['credit'])) ?> | B <?= e(format_currency((float) $l['balance'])) ?></p>
-        <?php endforeach; ?>
-        <?php if (!$supplierDetailLedger): ?><p class="text-sm text-slate-500"><?= e(__('ledger.no_ledger_transactions')) ?></p><?php endif; ?>
-    </div>
-</section>
-<div id="supplierDuePaymentModal" class="fixed inset-0 z-50 hidden items-end sm:items-center justify-center p-4">
-    <div class="absolute inset-0 bg-slate-900/50" data-close-modal="supplierDuePaymentModal"></div>
-    <div class="relative w-full max-w-2xl bg-white border border-slate-200 rounded-xl p-4">
-        <div class="flex items-center justify-between gap-3 mb-3">
-            <h3 class="font-semibold"><?= e(__('ledger.add_due_payment')) ?></h3>
-            <button type="button" class="btn btn-soft" data-close-modal="supplierDuePaymentModal"><?= e(__('common.close')) ?></button>
-        </div>
-        <form method="post" class="grid grid-cols-1 gap-3">
-            <?php if (i18n_locale() === 'ps'): ?><input type="hidden" name="lang" value="ps"><?php endif; ?>
-            <input type="hidden" name="action" value="add_supplier_due_payment">
-            <input type="hidden" name="supplier_id" value="<?= (int) $supplierDetail['id'] ?>">
-            <select name="transaction_id" class="border rounded-lg px-3 py-2 text-sm" required>
-                <option value=""><?= e(__('ledger.select_due_transaction')) ?></option>
-                <?php foreach ($supplierDetailTransactions as $tx): if ((float) ($tx['remaining_amount'] ?? 0) <= 0.00001) continue; ?>
-                    <option value="<?= (int) $tx['id'] ?>">SP-<?= (int) $tx['id'] ?> (<?= e(__('status.due')) ?>: <?= e(format_currency((float) $tx['remaining_amount'])) ?>)</option>
-                <?php endforeach; ?>
-            </select>
-            <input type="number" name="amount" step="0.01" min="0.01" required class="border rounded-lg px-3 py-2 text-sm" placeholder="<?= e(__('payments.amount')) ?>">
-            <select name="payment_type" class="border rounded-lg px-3 py-2 text-sm">
-                <option value="Cash"><?= e(__('suppliers.pay_cash')) ?></option>
-                <option value="Bank"><?= e(__('suppliers.pay_bank')) ?></option>
-                <option value="Credit"><?= e(__('suppliers.pay_credit')) ?></option>
-            </select>
-            <input type="date" name="payment_date" value="<?= date('Y-m-d') ?>" class="border rounded-lg px-3 py-2 text-sm">
-            <button class="bg-primary text-white rounded-lg px-3 py-2 text-sm w-full"><?= e(__('payments.save')) ?></button>
-        </form>
-    </div>
-</div>
-<?php endif; ?>
 <script>
 (() => {
     const i18n = <?= json_encode([

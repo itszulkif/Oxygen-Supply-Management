@@ -6,13 +6,13 @@ $pdo = db();
 $search = trim((string) ($_GET['q'] ?? ''));
 $like = '%' . $search . '%';
 
-$sql = "SELECT s.id, s.name, s.contact_person, s.phone,
+$sql = "SELECT s.id, s.name, s.contact_person, s.phone, s.opening_balance,
         COALESCE(SUM(t.total_amount), 0) AS purchases,
         COALESCE(SUM(t.paid_amount), 0) AS paid
     FROM suppliers s
     LEFT JOIN supplier_transactions t ON t.supplier_id = s.id
     WHERE (? = '' OR s.name LIKE ? OR s.phone LIKE ? OR s.contact_person LIKE ?)
-    GROUP BY s.id, s.name, s.contact_person, s.phone
+    GROUP BY s.id, s.name, s.contact_person, s.phone, s.opening_balance
     ORDER BY s.name ASC";
 $st = $pdo->prepare($sql);
 $st->execute([$search, $like, $like, $like]);
@@ -48,7 +48,7 @@ ob_start();
             <?php if (!$rows): ?>
                 <tr><td colspan="7" class="p-4 text-slate-500"><?= e(__('suppliers.no_suppliers')) ?></td></tr>
             <?php endif; ?>
-            <?php foreach ($rows as $row): $balance = max(0, (float) $row['purchases'] - (float) $row['paid']); ?>
+            <?php foreach ($rows as $row): $balance = supplier_amount_owed((float) ($row['opening_balance'] ?? 0), (float) $row['purchases'], (float) $row['paid']); ?>
                 <tr class="border-t border-slate-100">
                     <td class="p-3"><?= e((string) $row['name']) ?></td>
                     <td class="p-3"><?= e((string) ($row['contact_person'] ?? '-')) ?></td>
@@ -56,7 +56,7 @@ ob_start();
                     <td class="p-3"><?= e(format_currency((float) $row['purchases'])) ?></td>
                     <td class="p-3"><?= e(format_currency((float) $row['paid'])) ?></td>
                     <td class="p-3 <?= $balance > 0 ? 'text-amber-600 font-semibold' : 'text-emerald-600' ?>"><?= e(format_currency($balance)) ?></td>
-                    <td class="p-3"><a class="btn btn-soft" href="?module=ledger&supplier_q=<?= e(urlencode((string) $row['name'])) ?><?= i18n_lang_query() ?>">View ledger</a></td>
+                    <td class="p-3"><a class="btn btn-soft" href="?module=suppliers&action=view_ledger&id=<?= (int) $row['id'] ?><?= i18n_lang_query() ?>"><?= e(__('suppliers.btn_view_ledger')) ?></a></td>
                 </tr>
             <?php endforeach; ?>
             </tbody>
