@@ -9,7 +9,6 @@ $langQ = i18n_lang_query();
 $todayYmd = date('Y-m-d');
 
 $todayReceived = financial_net_received_for_range($pdo, $todayYmd, $todayYmd);
-$totalReceivedAllTime = financial_total_received_all_time($pdo);
 
 $supplierPending = supplier_global_pending_payments($pdo);
 
@@ -34,7 +33,7 @@ ob_start();
         <a href="?module=cash<?= $langQ ?>" class="btn btn-soft text-sm w-full sm:w-auto text-center shrink-0"><?= e(__('cash.open_log')) ?></a>
     </header>
 
-    <section class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4 sm:gap-5" aria-label="<?= e(__('dashboard.section_key_figures')) ?>">
+    <section class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-2 xl:grid-cols-4 gap-4 sm:gap-5" aria-label="<?= e(__('dashboard.section_key_figures')) ?>">
         <a href="?module=cash<?= $langQ ?>" class="group rounded-2xl border border-emerald-200 bg-gradient-to-br from-emerald-50 to-white p-5 sm:p-6 shadow-sm transition hover:shadow-md hover:border-emerald-300 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400">
             <div class="flex items-start justify-between gap-2">
                 <p class="text-xs font-semibold uppercase tracking-wide text-emerald-700"><?= e(__('dashboard.kpi_today_received')) ?></p>
@@ -46,17 +45,6 @@ ob_start();
             <p class="text-xs text-emerald-600/90 mt-2"><?= e(__('dashboard.kpi_today_received_sub')) ?></p>
         </a>
 
-        <a href="?module=cash<?= $langQ ?>" class="group rounded-2xl border border-teal-200 bg-gradient-to-br from-teal-50 to-white p-5 sm:p-6 shadow-sm transition hover:shadow-md hover:border-teal-300 focus:outline-none focus-visible:ring-2 focus-visible:ring-teal-400">
-            <div class="flex items-start justify-between gap-2">
-                <p class="text-xs font-semibold uppercase tracking-wide text-teal-800"><?= e(__('dashboard.kpi_total_received')) ?></p>
-                <span class="shrink-0 rounded-lg bg-teal-100 p-2 text-teal-700" aria-hidden="true">
-                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/></svg>
-                </span>
-            </div>
-            <p id="dashTotalReceived" class="text-2xl sm:text-3xl font-bold text-teal-900 mt-3 tabular-nums break-all"><?= e(format_currency($totalReceivedAllTime)) ?></p>
-            <p class="text-xs text-teal-700/90 mt-2"><?= e(__('dashboard.kpi_total_received_sub')) ?></p>
-        </a>
-
         <a href="?module=suppliers<?= $langQ ?>" class="group rounded-2xl border border-rose-200 bg-gradient-to-br from-rose-50/80 to-white p-5 sm:p-6 shadow-sm transition hover:shadow-md hover:border-rose-300 focus:outline-none focus-visible:ring-2 focus-visible:ring-rose-400">
             <div class="flex items-start justify-between gap-2">
                 <p class="text-xs font-semibold uppercase tracking-wide text-rose-700"><?= e(__('dashboard.kpi_supplier_pending')) ?></p>
@@ -64,11 +52,11 @@ ob_start();
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 14l6-6m-5.5.5h.01m4.99 5h.01M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16l3.5-2 3.5 2 3.5-2 3.5 2z"/></svg>
                 </span>
             </div>
-            <p class="text-2xl sm:text-3xl font-bold text-rose-700 mt-3 tabular-nums break-all"><?= e(format_currency($supplierPending)) ?></p>
+            <p id="dashSupplierPending" class="text-2xl sm:text-3xl font-bold text-rose-700 mt-3 tabular-nums break-all"><?= e(format_currency($supplierPending)) ?></p>
             <p class="text-xs text-rose-600/90 mt-2"><?= e(__('dashboard.kpi_supplier_pending_sub')) ?></p>
         </a>
 
-        <a href="?module=suppliers<?= $langQ ?>" class="group rounded-2xl border border-sky-200 bg-gradient-to-br from-sky-50/80 to-white p-5 sm:p-6 shadow-sm transition hover:shadow-md hover:border-sky-300 focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 sm:col-span-2 xl:col-span-1">
+        <a href="?module=suppliers<?= $langQ ?>" class="group rounded-2xl border border-sky-200 bg-gradient-to-br from-sky-50/80 to-white p-5 sm:p-6 shadow-sm transition hover:shadow-md hover:border-sky-300 focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-400">
             <div class="flex items-start justify-between gap-2">
                 <p class="text-xs font-semibold uppercase tracking-wide text-sky-800"><?= e(__('dashboard.kpi_inventory_stock')) ?></p>
                 <span class="shrink-0 rounded-lg bg-sky-100 p-2 text-sky-700" aria-hidden="true">
@@ -105,8 +93,8 @@ ob_start();
 (() => {
     if (!window.OxygenFinance?.onUpdated) return;
     const todayEl = document.getElementById('dashTodayReceived');
-    const totalEl = document.getElementById('dashTotalReceived');
-    if (!todayEl && !totalEl) return;
+    const supplierPendingEl = document.getElementById('dashSupplierPending');
+    if (!todayEl && !supplierPendingEl) return;
     window.OxygenFinance.onUpdated(async () => {
         try {
             const u = new URL(window.location.href);
@@ -118,8 +106,8 @@ ob_start();
             if (todayEl && data.pulse.today_received_formatted) {
                 todayEl.textContent = data.pulse.today_received_formatted;
             }
-            if (totalEl && data.pulse.total_received_all_time_formatted) {
-                totalEl.textContent = data.pulse.total_received_all_time_formatted;
+            if (supplierPendingEl && data.pulse.supplier_pending_formatted) {
+                supplierPendingEl.textContent = data.pulse.supplier_pending_formatted;
             }
         } catch (_) { /* ignore */ }
     });

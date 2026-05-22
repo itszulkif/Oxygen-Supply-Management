@@ -607,16 +607,12 @@ $loadTotalSentBySupplier = static function (PDO $pdo): array {
 
 $buildPayload = static function (PDO $pdo, string $search = '', string $fromDate = '', string $toDate = '', int $supplierFilter = 0, string $paymentPeriod = 'weekly', int $paymentSupplierFilter = 0) use ($loadSuppliersTable, $loadPurchaseRows, $loadPaymentHistory, $loadPendingBySupplier, $loadTotalSentBySupplier): array {
     $supplierCount = (int) $pdo->query('SELECT COUNT(*) FROM suppliers')->fetchColumn();
-    $totalPurchases = (float) $pdo->query('SELECT COALESCE(SUM(total_amount),0) FROM supplier_transactions')->fetchColumn();
+    $totalPurchases = financial_sum_supplier_purchases_total($pdo, '1970-01-01', '2099-12-31');
     $totalPaid = (float) $pdo->query('SELECT COALESCE(SUM(amount),0) FROM supplier_payments')->fetchColumn();
     $pendingPayments = supplier_global_pending_payments($pdo);
     $rows = $loadSuppliersTable($pdo, $search);
     foreach ($rows as &$supplierRow) {
-        $supplierRow['outstanding'] = supplier_amount_owed(
-            (float) ($supplierRow['opening_balance'] ?? 0),
-            (float) ($supplierRow['purchases'] ?? 0),
-            (float) ($supplierRow['paid'] ?? 0)
-        );
+        $supplierRow['outstanding'] = supplier_outstanding_balance($pdo, (int) ($supplierRow['id'] ?? 0));
     }
     unset($supplierRow);
     $supplierOptions = $pdo->query('SELECT id, name FROM suppliers ORDER BY name ASC')->fetchAll();
@@ -1158,7 +1154,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             $rebuildSupplierLedger($pdo, $supplierId);
             $pdo->commit();
-            $jsonResponse(true, __('suppliers.msg_payment_saved'), ['finance' => true]);
+            $jsonResponse(true, __('suppliers.msg_payment_saved'), [
+                'finance' => true,
+                'summary' => ['pending' => supplier_global_pending_payments($pdo)],
+            ]);
         }
 
         if ($action === 'delete_supplier_payment') {
@@ -1193,7 +1192,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
             $rebuildSupplierLedger($pdo, $supplierId);
             $pdo->commit();
-            $jsonResponse(true, __('suppliers.msg_payment_deleted'), ['finance' => true]);
+            $jsonResponse(true, __('suppliers.msg_payment_deleted'), [
+                'finance' => true,
+                'summary' => ['pending' => supplier_global_pending_payments($pdo)],
+            ]);
         }
     } catch (Throwable $e) {
         if ($pdo->inTransaction()) {
@@ -1977,7 +1979,7 @@ $supplierJs = [
             return;
         }
         suppliersTbody.innerHTML = supplierRows.map((row) => {
-            const balance = Number(row.outstanding ?? Math.max(0, Number(row.opening_balance || 0) + Number(row.purchases || 0) - Number(row.paid || 0)));
+            const balance = Math.max(0, Number(row.outstanding ?? 0));
             return `<tr class="border-t border-slate-100 fade-in">
                 <td class="p-3">${escapeHtml(row.name)}</td>
                 <td class="p-3">${escapeHtml(row.contact_person || '-')}</td>
@@ -2072,6 +2074,27 @@ $supplierJs = [
         const priceField = purchaseForm.elements.recv_total_price || purchaseForm.recv_total_price;
         if (qtyField) qtyField.value = '';
         if (priceField) priceField.value = '';
+    };
+
+    const applySummaryFromServer = (summary) => {
+        if (!summary || summary.pending == null) return;
+        currentData.summary = { ...(currentData.summary || {}), pending: summary.pending };
+        renderSummary();
+    };
+
+    const refreshDashboardData = async () => {
+        const body = new FormData();
+        body.append('action', 'fetch_dashboard');
+        body.append('search', document.getElementById('supplierSearch')?.value || '');
+        body.append('from_date', document.getElementById('filterFromDate')?.value || '');
+        body.append('to_date', document.getElementById('filterToDate')?.value || '');
+        body.append('supplier_filter', supplierFilter?.value || '0');
+        body.append('payment_period', paymentPeriodFilter?.value || 'weekly');
+        body.append('payment_supplier_filter', paymentSupplierFilter?.value || '0');
+        const result = await request(body);
+        if (!result.ok || !result.data) return;
+        currentData = result.data;
+        renderAll();
     };
 
     const renderAll = () => {
@@ -2507,6 +2530,11 @@ $supplierJs = [
             const result = await request(body);
             showToast(result.message || t.done);
             if (!result.ok) return;
+            applySummaryFromServer(result.summary);
+            if (result.finance && window.OxygenFinance?.notify) {
+                window.OxygenFinance.notify({ source: 'supplier_payment' });
+            }
+            await refreshDashboardData();
             if (supplierId > 0) {
                 await loadSupplierHistory(supplierId);
             }
@@ -2534,9 +2562,11 @@ $supplierJs = [
         const result = await request(body);
         showToast(result.message || t.saved);
         if (!result.ok) return;
+        applySummaryFromServer(result.summary);
         if (result.finance && window.OxygenFinance?.notify) {
             window.OxygenFinance.notify({ source: 'supplier_payment' });
         }
+        await refreshDashboardData();
         await loadSupplierHistory(supplierId);
     });
 
@@ -2559,7 +2589,8 @@ $supplierJs = [
 
 (() => {
     const totalEl = document.getElementById('suppTotalReceived');
-    if (!totalEl || !window.OxygenFinance?.onUpdated) return;
+    const pendingKpi = document.querySelector('#summaryCards [data-key="pending"]');
+    if ((!totalEl && !pendingKpi) || !window.OxygenFinance?.onUpdated) return;
     window.OxygenFinance.onUpdated(async () => {
         try {
             const u = new URL(window.location.href);
@@ -2567,8 +2598,12 @@ $supplierJs = [
             u.searchParams.set('ajax', 'finance_pulse');
             const res = await fetch(u.toString(), { headers: { 'X-Requested-With': 'XMLHttpRequest' } });
             const data = await res.json();
-            if (data.ok && data.pulse?.total_received_all_time_formatted) {
+            if (!data.ok || !data.pulse) return;
+            if (totalEl && data.pulse.total_received_all_time_formatted) {
                 totalEl.textContent = data.pulse.total_received_all_time_formatted;
+            }
+            if (pendingKpi && data.pulse.supplier_pending_formatted) {
+                pendingKpi.textContent = data.pulse.supplier_pending_formatted;
             }
         } catch (_) { /* ignore */ }
     });

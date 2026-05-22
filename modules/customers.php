@@ -2,6 +2,13 @@
 
 $pdo = db();
 
+if (($_GET['ajax'] ?? '') === 'opening_summary') {
+    header('Content-Type: application/json; charset=utf-8');
+    $totals = customers_global_opening_totals($pdo);
+    echo json_encode(['ok' => true, 'totals' => $totals], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
 if (($_GET['ajax'] ?? '') === 'customer_balance') {
     header('Content-Type: application/json; charset=utf-8');
     $cid = (int) ($_GET['customer_id'] ?? 0);
@@ -165,9 +172,34 @@ if ($detailId > 0) {
 }
 
 $detailOutstanding = $detail ? customer_receivable_balance($pdo, $detailId) : 0.0;
+$openingTotals = customers_global_opening_totals($pdo);
 
 ob_start();
 ?>
+<?php if ($detailId <= 0): ?>
+<section class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4" aria-label="<?= e(__('customers.kpi_section_label')) ?>" id="customersOpeningKpis">
+    <div class="rounded-2xl border border-amber-200 bg-gradient-to-br from-amber-50/90 to-white p-5 sm:p-6 shadow-sm">
+        <div class="flex items-start justify-between gap-2">
+            <p class="text-xs font-semibold uppercase tracking-wide text-amber-800"><?= e(__('customers.kpi_opening_balance_title')) ?></p>
+            <span class="shrink-0 rounded-lg bg-amber-100 p-2 text-amber-700" aria-hidden="true">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1"/></svg>
+            </span>
+        </div>
+        <p id="customersKpiOpeningBalance" class="text-2xl sm:text-3xl font-bold text-amber-900 mt-3 tabular-nums break-all"><?= e($openingTotals['opening_balance_formatted']) ?></p>
+        <p class="text-xs text-amber-700/90 mt-2"><?= e(__('customers.kpi_opening_balance_sub')) ?></p>
+    </div>
+    <div class="rounded-2xl border border-violet-200 bg-gradient-to-br from-violet-50/80 to-white p-5 sm:p-6 shadow-sm">
+        <div class="flex items-start justify-between gap-2">
+            <p class="text-xs font-semibold uppercase tracking-wide text-violet-800"><?= e(__('customers.kpi_opening_cylinders_title')) ?></p>
+            <span class="shrink-0 rounded-lg bg-violet-100 p-2 text-violet-700" aria-hidden="true">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"/></svg>
+            </span>
+        </div>
+        <p id="customersKpiOpeningCylinders" class="text-2xl sm:text-3xl font-bold text-violet-900 mt-3 tabular-nums"><?= e($openingTotals['opening_cylinders_formatted']) ?></p>
+        <p class="text-xs text-violet-700/90 mt-2"><?= e(__('customers.kpi_opening_cylinders_sub')) ?></p>
+    </div>
+</section>
+<?php endif; ?>
 <section class="bg-white border border-slate-200 rounded-xl overflow-hidden">
     <div class="p-4 border-b border-slate-200 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <h3 class="font-semibold shrink-0"><?= e(__('meta.customers')) ?></h3>
@@ -283,14 +315,29 @@ document.addEventListener('DOMContentLoaded', () => {
 <?php endif; ?>
 <script>
 (() => {
-    if (!window.OxygenFinance?.onUpdated) return;
     const detailId = <?= (int) $detailId ?>;
-    window.OxygenFinance.onUpdated(async (payload) => {
-        const cid = Number(payload?.customerId || 0);
-        if (detailId > 0 && cid === detailId) {
-            window.location.reload();
-            return;
-        }
+    const balanceKpi = document.getElementById('customersKpiOpeningBalance');
+    const cylindersKpi = document.getElementById('customersKpiOpeningCylinders');
+
+    const refreshOpeningKpis = async () => {
+        if (!balanceKpi && !cylindersKpi) return;
+        try {
+            const u = new URL(window.location.href);
+            u.searchParams.set('module', 'customers');
+            u.searchParams.set('ajax', 'opening_summary');
+            const res = await fetch(u.toString(), { headers: { 'X-Requested-With': 'XMLHttpRequest' } });
+            const data = await res.json();
+            if (!data.ok || !data.totals) return;
+            if (balanceKpi && data.totals.opening_balance_formatted) {
+                balanceKpi.textContent = data.totals.opening_balance_formatted;
+            }
+            if (cylindersKpi && data.totals.opening_cylinders_formatted !== undefined) {
+                cylindersKpi.textContent = data.totals.opening_cylinders_formatted;
+            }
+        } catch (_) { /* ignore */ }
+    };
+
+    const refreshCustomerRow = async (cid) => {
         if (cid <= 0) return;
         const row = document.querySelector(`tr[data-customer-id="${cid}"]`);
         const cell = row?.querySelector('[data-customer-outstanding]');
@@ -310,7 +357,31 @@ document.addEventListener('DOMContentLoaded', () => {
             cell.classList.toggle('font-medium', rec > 0.00001);
             cell.classList.toggle('text-primary', rec <= 0.00001);
         } catch (_) { /* ignore */ }
-    });
+    };
+
+    if (window.OxygenFinance?.onUpdated) {
+        window.OxygenFinance.onUpdated(async (payload) => {
+            const cid = Number(payload?.customerId || 0);
+            if (detailId > 0 && cid === detailId) {
+                window.location.reload();
+                return;
+            }
+            if (document.visibilityState === 'visible') {
+                await refreshOpeningKpis();
+            }
+            if (cid > 0) {
+                await refreshCustomerRow(cid);
+            }
+        });
+    }
+
+    if (detailId <= 0 && (balanceKpi || cylindersKpi)) {
+        window.setInterval(() => {
+            if (document.visibilityState === 'visible') {
+                refreshOpeningKpis();
+            }
+        }, 30000);
+    }
 })();
 </script>
 <?php

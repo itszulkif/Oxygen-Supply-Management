@@ -149,7 +149,7 @@ function render_layout(string $title, string $content, array $options = []): voi
                 <nav class="space-y-1">
                     <?php foreach ($nav as $item): $key = $item['key']; ?>
                         <a href="?module=<?= e($key) ?><?= i18n_lang_query() ?>"
-                           class="flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm transition <?= $module === $key ? 'bg-sky-100 text-oxygenDeep font-semibold' : 'text-slate-600 hover:bg-slate-100' ?>">
+                           class="flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm transition <?= ($module === $key || ($key === 'cash' && $module === 'cash_log')) ? 'bg-sky-100 text-oxygenDeep font-semibold' : 'text-slate-600 hover:bg-slate-100' ?>">
                             <svg class="h-4 w-4 shrink-0" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="<?= e($item['icon']) ?>"></path></svg>
                             <span><?= e($item['label']) ?></span>
                         </a>

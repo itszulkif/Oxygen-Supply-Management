@@ -15,6 +15,7 @@ $allowedModules = [
     'logout',
     'dashboard',
     'cash',
+    'cash_log',
     'suppliers',
     'customers',
     'services',

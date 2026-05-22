@@ -3,7 +3,7 @@
 -- https://www.phpmyadmin.net/
 --
 -- Host: 127.0.0.1
--- Generation Time: May 19, 2026 at 03:19 PM
+-- Generation Time: May 22, 2026 at 02:00 PM
 -- Server version: 10.4.32-MariaDB
 -- PHP Version: 8.2.12
 
@@ -38,6 +38,13 @@ CREATE TABLE `cash_transactions` (
   `created_at` timestamp NOT NULL DEFAULT current_timestamp()
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+--
+-- Dumping data for table `cash_transactions`
+--
+
+INSERT INTO `cash_transactions` (`id`, `category`, `description`, `inflow`, `outflow`, `transaction_date`, `is_opening`, `created_at`) VALUES
+(10, 'Opening Balance', 'Opening Balance / Initial Setup', 1000.00, 0.00, '2026-05-22', 1, '2026-05-22 11:17:39');
+
 -- --------------------------------------------------------
 
 --
@@ -52,6 +59,18 @@ CREATE TABLE `customers` (
   `current_cylinder_balance` int(11) NOT NULL DEFAULT 0,
   `created_at` timestamp NOT NULL DEFAULT current_timestamp()
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+--
+-- Dumping data for table `customers`
+--
+
+INSERT INTO `customers` (`id`, `name`, `phone`, `address`, `current_cylinder_balance`, `created_at`) VALUES
+(28, 'Muhammad Zulkif', '45656', 'Karkhano Peshawar', 1, '2026-05-22 11:21:16'),
+(29, 'amir', '324432', 'afsdsdfd', 1, '2026-05-22 11:29:11'),
+(30, 'Jawad', '43224', '', 0, '2026-05-22 11:31:23'),
+(31, 'haris', 'w523352523', 'w', 0, '2026-05-22 11:39:50'),
+(32, 'haroon', '32432234', '', 0, '2026-05-22 11:42:15'),
+(33, 'Umar', '432444', '', 1, '2026-05-22 11:53:50');
 
 -- --------------------------------------------------------
 
@@ -68,6 +87,16 @@ CREATE TABLE `customer_cylinder_balance` (
   `updated_at` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp()
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+--
+-- Dumping data for table `customer_cylinder_balance`
+--
+
+INSERT INTO `customer_cylinder_balance` (`id`, `customer_id`, `cylinder_size`, `balance_qty`, `created_at`, `updated_at`) VALUES
+(45, 28, 'Small', 1, '2026-05-22 11:22:07', '2026-05-22 11:22:07'),
+(46, 29, 'Small', 1, '2026-05-22 11:29:27', '2026-05-22 11:29:27'),
+(47, 30, 'Small', 0, '2026-05-22 11:32:00', '2026-05-22 11:32:00'),
+(48, 33, 'Small', 1, '2026-05-22 11:56:22', '2026-05-22 11:56:22');
+
 -- --------------------------------------------------------
 
 --
@@ -82,6 +111,13 @@ CREATE TABLE `cylinders` (
   `empty` int(11) NOT NULL DEFAULT 0,
   `updated_at` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp()
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+--
+-- Dumping data for table `cylinders`
+--
+
+INSERT INTO `cylinders` (`id`, `total`, `available`, `issued`, `empty`, `updated_at`) VALUES
+(23, 15.00, 7.00, 4, 8, '2026-05-22 11:56:23');
 
 -- --------------------------------------------------------
 
@@ -106,7 +142,7 @@ CREATE TABLE `cylinder_stock_by_type` (
 --
 
 INSERT INTO `cylinder_stock_by_type` (`id`, `cylinder_type`, `total`, `available`, `daka_qty`, `tash_qty`, `available_pressure`, `created_at`, `updated_at`) VALUES
-(2850, 'Small', 0.00, 0.00, 0, 0, 0.00, '2026-05-19 12:46:34', '2026-05-19 12:46:34');
+(3022, 'Small', 12.00, 7.00, 7, 8, 0.00, '2026-05-22 11:12:48', '2026-05-22 11:56:22');
 
 -- --------------------------------------------------------
 
@@ -121,6 +157,27 @@ CREATE TABLE `employee_salaries` (
   `salary_date` date NOT NULL,
   `notes` text DEFAULT NULL,
   `created_at` timestamp NOT NULL DEFAULT current_timestamp()
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+--
+-- Dumping data for table `employee_salaries`
+--
+
+INSERT INTO `employee_salaries` (`id`, `employee_name`, `amount`, `salary_date`, `notes`, `created_at`) VALUES
+(4, 'Kamran', 100.00, '2026-05-22', NULL, '2026-05-22 11:26:03');
+
+-- --------------------------------------------------------
+
+--
+-- Table structure for table `financial_month_closures`
+--
+
+CREATE TABLE `financial_month_closures` (
+  `id` int(11) NOT NULL,
+  `month_key` char(7) NOT NULL,
+  `closed_at` timestamp NOT NULL DEFAULT current_timestamp(),
+  `closed_by_user_id` int(11) DEFAULT NULL,
+  `snapshot_json` text DEFAULT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- --------------------------------------------------------
@@ -140,6 +197,13 @@ CREATE TABLE `general_expenses` (
   `created_at` timestamp NOT NULL DEFAULT current_timestamp()
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+--
+-- Dumping data for table `general_expenses`
+--
+
+INSERT INTO `general_expenses` (`id`, `description`, `category`, `amount`, `expense_date`, `payment_type`, `notes`, `created_at`) VALUES
+(3, 'Tea', 'General', 100.00, '2026-05-22', 'Cash', NULL, '2026-05-22 11:25:41');
+
 -- --------------------------------------------------------
 
 --
@@ -156,6 +220,16 @@ CREATE TABLE `invoices` (
   `status` enum('Pending','Paid') NOT NULL DEFAULT 'Pending',
   `created_at` timestamp NOT NULL DEFAULT current_timestamp()
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+--
+-- Dumping data for table `invoices`
+--
+
+INSERT INTO `invoices` (`id`, `customer_id`, `service_id`, `total_amount`, `paid_amount`, `remaining_amount`, `status`, `created_at`) VALUES
+(38, 28, 38, 400.00, 400.00, 0.00, 'Paid', '2026-05-22 11:22:07'),
+(39, 29, 39, 100.00, 100.00, 0.00, 'Paid', '2026-05-22 11:29:27'),
+(40, 30, 40, 100.00, 100.00, 0.00, 'Paid', '2026-05-22 11:32:00'),
+(41, 33, 41, 100.00, 100.00, 0.00, 'Paid', '2026-05-22 11:56:22');
 
 -- --------------------------------------------------------
 
@@ -179,6 +253,33 @@ CREATE TABLE `ledger` (
   `created_at` timestamp NOT NULL DEFAULT current_timestamp()
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+--
+-- Dumping data for table `ledger`
+--
+
+INSERT INTO `ledger` (`id`, `customer_id`, `debit`, `credit`, `balance`, `date`, `description`, `cylinders_sent`, `cylinders_received`, `cylinders_baqi`, `reference_type`, `reference_id`, `created_at`) VALUES
+(99, 28, 200.00, 0.00, 200.00, '2026-05-22', 'Opening balance owed / Initial setup', 0, 0, 2, 'opening_balance', 28, '2026-05-22 11:21:16'),
+(100, 28, 200.00, 0.00, 400.00, '2026-05-22', 'Cylinder exchange & gas refill order', 1, 2, -1, 'service', 38, '2026-05-22 11:22:07'),
+(101, 28, 0.00, 200.00, 200.00, '2026-05-22', 'Payment for Order #38 - Cylinder exchange & gas refill order', 0, 0, 0, 'service', 38, '2026-05-22 11:22:07'),
+(102, 28, 0.00, 200.00, 0.00, '2026-05-22', 'Payment received for INV-38', 0, 0, 0, 'payment', 59, '2026-05-22 11:22:35'),
+(103, 28, 0.00, 0.00, 0.00, '2026-05-22', 'Cylinder return received', 0, 2, 0, 'cylinder_settlement', 0, '2026-05-22 11:23:23'),
+(104, 29, 100.00, 0.00, 100.00, '2026-05-22', 'Cylinder exchange & gas refill order', 1, 0, 1, 'service', 39, '2026-05-22 11:29:27'),
+(105, 29, 0.00, 100.00, 0.00, '2026-05-22', 'Payment for Order #39 - Cylinder exchange & gas refill order', 0, 0, 0, 'service', 39, '2026-05-22 11:29:27'),
+(106, 30, 100.00, 0.00, 100.00, '2026-05-22', 'Cylinder exchange & gas refill order', 1, 1, 0, 'service', 40, '2026-05-22 11:32:00'),
+(107, 30, 0.00, 100.00, 0.00, '2026-05-22', 'Payment for Order #40 - Cylinder exchange & gas refill order', 0, 0, 0, 'service', 40, '2026-05-22 11:32:00'),
+(108, 31, 10000.00, 0.00, 10000.00, '2026-05-22', 'Opening balance owed / Initial setup', 0, 0, 1, 'opening_balance', 31, '2026-05-22 11:39:50'),
+(109, 31, 0.00, 1000.00, 9000.00, '2026-05-22', 'Payment received (opening / account balance)', 0, 0, 0, 'opening_payment', 31, '2026-05-22 11:40:47'),
+(110, 31, 0.00, 9000.00, 0.00, '2026-05-22', 'Payment received (opening / account balance)', 0, 0, 0, 'opening_payment', 31, '2026-05-22 11:41:03'),
+(111, 31, 0.00, 0.00, 0.00, '2026-05-22', 'Cylinder return received', 0, 1, 0, 'cylinder_settlement', 0, '2026-05-22 11:41:05'),
+(112, 32, 500.00, 0.00, 500.00, '2026-05-22', 'Opening balance owed / Initial setup', 0, 0, 1, 'opening_balance', 32, '2026-05-22 11:42:15'),
+(113, 32, 0.00, 500.00, 0.00, '2026-05-22', 'Payment received (opening / account balance)', 0, 0, 0, 'opening_payment', 32, '2026-05-22 11:52:21'),
+(114, 32, 0.00, 0.00, 0.00, '2026-05-22', 'Cylinder return received', 0, 1, 0, 'cylinder_settlement', 0, '2026-05-22 11:52:25'),
+(115, 33, 500.00, 0.00, 500.00, '2026-05-22', 'Opening balance owed / Initial setup', 0, 0, 1, 'opening_balance', 33, '2026-05-22 11:53:50'),
+(116, 33, 0.00, 500.00, 0.00, '2026-05-22', 'Payment received (opening / account balance)', 0, 0, 0, 'opening_payment', 33, '2026-05-22 11:55:29'),
+(117, 33, 0.00, 0.00, 0.00, '2026-05-22', 'Cylinder return received', 0, 1, 0, 'cylinder_settlement', 0, '2026-05-22 11:55:36'),
+(118, 33, 100.00, 0.00, 100.00, '2026-05-22', 'Cylinder exchange & gas refill order', 1, 0, 1, 'service', 41, '2026-05-22 11:56:22'),
+(119, 33, 0.00, 100.00, 0.00, '2026-05-22', 'Payment for Order #41 - Cylinder exchange & gas refill order', 0, 0, 0, 'service', 41, '2026-05-22 11:56:22');
+
 -- --------------------------------------------------------
 
 --
@@ -192,6 +293,17 @@ CREATE TABLE `payments` (
   `payment_date` date NOT NULL,
   `created_at` timestamp NOT NULL DEFAULT current_timestamp()
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+--
+-- Dumping data for table `payments`
+--
+
+INSERT INTO `payments` (`id`, `invoice_id`, `amount`, `payment_date`, `created_at`) VALUES
+(58, 38, 200.00, '2026-05-22', '2026-05-22 11:22:07'),
+(59, 38, 200.00, '2026-05-22', '2026-05-22 11:22:35'),
+(60, 39, 100.00, '2026-05-22', '2026-05-22 11:29:27'),
+(61, 40, 100.00, '2026-05-22', '2026-05-22 11:32:00'),
+(62, 41, 100.00, '2026-05-22', '2026-05-22 11:56:22');
 
 -- --------------------------------------------------------
 
@@ -209,6 +321,13 @@ CREATE TABLE `refill_discrepancy` (
   `notes` varchar(255) DEFAULT NULL,
   `created_at` timestamp NOT NULL DEFAULT current_timestamp()
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+--
+-- Dumping data for table `refill_discrepancy`
+--
+
+INSERT INTO `refill_discrepancy` (`id`, `supplier_id`, `transaction_id`, `sent_quantity`, `received_fully`, `difference_quantity`, `notes`, `created_at`) VALUES
+(51, 32, 77, 2, 1, 1, 'Dispatch vs receipt cylinder count', '2026-05-22 11:19:34');
 
 -- --------------------------------------------------------
 
@@ -248,6 +367,16 @@ CREATE TABLE `services` (
   `created_at` timestamp NOT NULL DEFAULT current_timestamp()
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+--
+-- Dumping data for table `services`
+--
+
+INSERT INTO `services` (`id`, `customer_id`, `service_type`, `quantity`, `price`, `total_bill`, `service_charges`, `previous_balance`, `grand_total`, `paid_amount`, `remaining_balance`, `notes`, `date`, `created_at`) VALUES
+(38, 28, 'refill', 1, 200.00, 200.00, 0.00, 200.00, 400.00, 400.00, 0.00, 'Cylinder exchange & gas refill order', '2026-05-22', '2026-05-22 11:22:07'),
+(39, 29, 'refill', 1, 100.00, 100.00, 0.00, 0.00, 100.00, 100.00, 0.00, 'Cylinder exchange & gas refill order', '2026-05-22', '2026-05-22 11:29:27'),
+(40, 30, 'refill', 1, 100.00, 100.00, 0.00, 0.00, 100.00, 100.00, 0.00, 'Cylinder exchange & gas refill order', '2026-05-22', '2026-05-22 11:32:00'),
+(41, 33, 'refill', 1, 100.00, 100.00, 0.00, 0.00, 100.00, 100.00, 0.00, 'Cylinder exchange & gas refill order', '2026-05-22', '2026-05-22 11:56:22');
+
 -- --------------------------------------------------------
 
 --
@@ -269,6 +398,16 @@ CREATE TABLE `service_cylinder_rows` (
   `total_amount` decimal(12,2) NOT NULL DEFAULT 0.00,
   `created_at` timestamp NOT NULL DEFAULT current_timestamp()
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+--
+-- Dumping data for table `service_cylinder_rows`
+--
+
+INSERT INTO `service_cylinder_rows` (`id`, `service_id`, `cylinder_size`, `sent_qty`, `received_qty`, `sale_units`, `baqi_qty`, `rate`, `billing_basis`, `sale_pressure`, `sold_pressure_total`, `total_amount`, `created_at`) VALUES
+(37, 38, 'Small', 1, 2, 1, 1, 200.00, 'quantity', 0.00, 0.00, 200.00, '2026-05-22 11:22:07'),
+(38, 39, 'Small', 1, 0, 1, 1, 100.00, 'quantity', 0.00, 0.00, 100.00, '2026-05-22 11:29:27'),
+(39, 40, 'Small', 1, 1, 1, 0, 100.00, 'quantity', 0.00, 0.00, 100.00, '2026-05-22 11:32:00'),
+(40, 41, 'Small', 1, 0, 1, 1, 100.00, 'quantity', 0.00, 0.00, 100.00, '2026-05-22 11:56:22');
 
 -- --------------------------------------------------------
 
@@ -312,6 +451,13 @@ CREATE TABLE `suppliers` (
   `created_at` timestamp NOT NULL DEFAULT current_timestamp()
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+--
+-- Dumping data for table `suppliers`
+--
+
+INSERT INTO `suppliers` (`id`, `name`, `contact_person`, `phone`, `email`, `address`, `opening_balance`, `created_at`) VALUES
+(32, 'ASA oxygen limited', 'asif', '5678y78', NULL, '', 100.00, '2026-05-22 11:18:55');
+
 -- --------------------------------------------------------
 
 --
@@ -331,6 +477,16 @@ CREATE TABLE `supplier_ledger` (
   `created_at` timestamp NOT NULL DEFAULT current_timestamp()
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+--
+-- Dumping data for table `supplier_ledger`
+--
+
+INSERT INTO `supplier_ledger` (`id`, `supplier_id`, `debit`, `credit`, `balance`, `reference_type`, `reference_id`, `description`, `entry_date`, `created_at`) VALUES
+(272, 32, 100.00, 0.00, 100.00, 'opening_balance', 32, 'Opening balance owed (pending liability)', '2026-05-22', '2026-05-22 11:20:33'),
+(273, 32, 200.00, 0.00, 300.00, 'purchase', 77, 'oxygen refile', '2026-05-22', '2026-05-22 11:20:33'),
+(274, 32, 0.00, 200.00, 100.00, 'payment', 99, 'Installment #SP-77 (Cash) —  200.00 toward refill purchase', '2026-05-22', '2026-05-22 11:20:33'),
+(275, 32, 0.00, 100.00, 0.00, 'payment', 100, 'Payment toward opening balance —  100.00 (Cash)', '2026-05-22', '2026-05-22 11:20:33');
+
 -- --------------------------------------------------------
 
 --
@@ -347,6 +503,14 @@ CREATE TABLE `supplier_payments` (
   `created_at` timestamp NOT NULL DEFAULT current_timestamp()
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+--
+-- Dumping data for table `supplier_payments`
+--
+
+INSERT INTO `supplier_payments` (`id`, `supplier_id`, `transaction_id`, `amount`, `payment_type`, `payment_date`, `created_at`) VALUES
+(99, 32, 77, 200.00, 'Cash', '2026-05-22', '2026-05-22 11:19:34'),
+(100, 32, NULL, 100.00, 'Cash', '2026-05-22', '2026-05-22 11:20:33');
+
 -- --------------------------------------------------------
 
 --
@@ -359,6 +523,13 @@ CREATE TABLE `supplier_pending_cylinders` (
   `pending_count` int(11) NOT NULL DEFAULT 0,
   `updated_at` timestamp NOT NULL DEFAULT current_timestamp() ON UPDATE current_timestamp()
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+--
+-- Dumping data for table `supplier_pending_cylinders`
+--
+
+INSERT INTO `supplier_pending_cylinders` (`supplier_id`, `cylinder_type`, `pending_count`, `updated_at`) VALUES
+(32, 'Small', 1, '2026-05-22 11:19:34');
 
 -- --------------------------------------------------------
 
@@ -377,6 +548,13 @@ CREATE TABLE `supplier_refill_breakdown` (
   `inventory_qty` decimal(12,2) NOT NULL DEFAULT 0.00,
   `created_at` timestamp NOT NULL DEFAULT current_timestamp()
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+--
+-- Dumping data for table `supplier_refill_breakdown`
+--
+
+INSERT INTO `supplier_refill_breakdown` (`id`, `transaction_id`, `refill_cylinder_type`, `status_label`, `quantity`, `pressure_received`, `line_unit_price`, `inventory_qty`, `created_at`) VALUES
+(95, 77, 'Small', 'Refill Receipt', 1, NULL, 200.00, 1.00, '2026-05-22 11:19:34');
 
 -- --------------------------------------------------------
 
@@ -412,6 +590,13 @@ CREATE TABLE `supplier_transactions` (
   `transaction_date` date NOT NULL,
   `created_at` timestamp NOT NULL DEFAULT current_timestamp()
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+--
+-- Dumping data for table `supplier_transactions`
+--
+
+INSERT INTO `supplier_transactions` (`id`, `supplier_id`, `sent_quantity`, `date_sent`, `sent_pressure`, `sent_qty_small`, `sent_qty_medium`, `sent_qty_large`, `sent_pressure_small`, `sent_pressure_medium`, `sent_pressure_large`, `cylinder_type`, `quantity`, `total_received`, `inventory_quantity`, `received_fully_quantity`, `received_pressure_total`, `unit_price`, `total_amount`, `paid_amount`, `remaining_amount`, `payment_type`, `payment_status`, `notes`, `transaction_date`, `created_at`) VALUES
+(77, 32, 2, '2026-05-22', NULL, 2, 0, 0, NULL, NULL, NULL, 'Small', 1, 1, 1.00, 1, 0.00, 200.00, 200.00, 200.00, 0.00, 'Cash', 'PAID', 'oxygen refile', '2026-05-22', '2026-05-22 11:19:34');
 
 -- --------------------------------------------------------
 
@@ -480,6 +665,13 @@ ALTER TABLE `cylinder_stock_by_type`
 ALTER TABLE `employee_salaries`
   ADD PRIMARY KEY (`id`),
   ADD KEY `idx_salary_date` (`salary_date`);
+
+--
+-- Indexes for table `financial_month_closures`
+--
+ALTER TABLE `financial_month_closures`
+  ADD PRIMARY KEY (`id`),
+  ADD UNIQUE KEY `uq_fin_month_key` (`month_key`);
 
 --
 -- Indexes for table `general_expenses`
@@ -601,67 +793,73 @@ ALTER TABLE `users`
 -- AUTO_INCREMENT for table `cash_transactions`
 --
 ALTER TABLE `cash_transactions`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=4;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=11;
 
 --
 -- AUTO_INCREMENT for table `customers`
 --
 ALTER TABLE `customers`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=26;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=34;
 
 --
 -- AUTO_INCREMENT for table `customer_cylinder_balance`
 --
 ALTER TABLE `customer_cylinder_balance`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=43;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=49;
 
 --
 -- AUTO_INCREMENT for table `cylinders`
 --
 ALTER TABLE `cylinders`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=18;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=24;
 
 --
 -- AUTO_INCREMENT for table `cylinder_stock_by_type`
 --
 ALTER TABLE `cylinder_stock_by_type`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=2854;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=3129;
 
 --
 -- AUTO_INCREMENT for table `employee_salaries`
 --
 ALTER TABLE `employee_salaries`
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=5;
+
+--
+-- AUTO_INCREMENT for table `financial_month_closures`
+--
+ALTER TABLE `financial_month_closures`
   MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=2;
 
 --
 -- AUTO_INCREMENT for table `general_expenses`
 --
 ALTER TABLE `general_expenses`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=4;
 
 --
 -- AUTO_INCREMENT for table `invoices`
 --
 ALTER TABLE `invoices`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=36;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=42;
 
 --
 -- AUTO_INCREMENT for table `ledger`
 --
 ALTER TABLE `ledger`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=94;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=120;
 
 --
 -- AUTO_INCREMENT for table `payments`
 --
 ALTER TABLE `payments`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=55;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=63;
 
 --
 -- AUTO_INCREMENT for table `refill_discrepancy`
 --
 ALTER TABLE `refill_discrepancy`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=48;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=52;
 
 --
 -- AUTO_INCREMENT for table `reminders`
@@ -673,13 +871,13 @@ ALTER TABLE `reminders`
 -- AUTO_INCREMENT for table `services`
 --
 ALTER TABLE `services`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=36;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=42;
 
 --
 -- AUTO_INCREMENT for table `service_cylinder_rows`
 --
 ALTER TABLE `service_cylinder_rows`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=35;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=41;
 
 --
 -- AUTO_INCREMENT for table `settings`
@@ -691,31 +889,31 @@ ALTER TABLE `settings`
 -- AUTO_INCREMENT for table `suppliers`
 --
 ALTER TABLE `suppliers`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=26;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=33;
 
 --
 -- AUTO_INCREMENT for table `supplier_ledger`
 --
 ALTER TABLE `supplier_ledger`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=227;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=276;
 
 --
 -- AUTO_INCREMENT for table `supplier_payments`
 --
 ALTER TABLE `supplier_payments`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=87;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=101;
 
 --
 -- AUTO_INCREMENT for table `supplier_refill_breakdown`
 --
 ALTER TABLE `supplier_refill_breakdown`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=87;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=96;
 
 --
 -- AUTO_INCREMENT for table `supplier_transactions`
 --
 ALTER TABLE `supplier_transactions`
-  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=69;
+  MODIFY `id` int(11) NOT NULL AUTO_INCREMENT, AUTO_INCREMENT=78;
 
 --
 -- AUTO_INCREMENT for table `users`

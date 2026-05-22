@@ -7,12 +7,10 @@ $search = trim((string) ($_GET['q'] ?? ''));
 $like = '%' . $search . '%';
 
 $sql = "SELECT s.id, s.name, s.contact_person, s.phone, s.opening_balance,
-        COALESCE(SUM(t.total_amount), 0) AS purchases,
-        COALESCE(SUM(t.paid_amount), 0) AS paid
+        COALESCE((SELECT SUM(t.total_amount) FROM supplier_transactions t WHERE t.supplier_id = s.id), 0) AS purchases,
+        COALESCE((SELECT SUM(p.amount) FROM supplier_payments p WHERE p.supplier_id = s.id), 0) AS paid
     FROM suppliers s
-    LEFT JOIN supplier_transactions t ON t.supplier_id = s.id
     WHERE (? = '' OR s.name LIKE ? OR s.phone LIKE ? OR s.contact_person LIKE ?)
-    GROUP BY s.id, s.name, s.contact_person, s.phone, s.opening_balance
     ORDER BY s.name ASC";
 $st = $pdo->prepare($sql);
 $st->execute([$search, $like, $like, $like]);
@@ -48,7 +46,7 @@ ob_start();
             <?php if (!$rows): ?>
                 <tr><td colspan="7" class="p-4 text-slate-500"><?= e(__('suppliers.no_suppliers')) ?></td></tr>
             <?php endif; ?>
-            <?php foreach ($rows as $row): $balance = supplier_amount_owed((float) ($row['opening_balance'] ?? 0), (float) $row['purchases'], (float) $row['paid']); ?>
+            <?php foreach ($rows as $row): $balance = supplier_outstanding_balance($pdo, (int) ($row['id'] ?? 0)); ?>
                 <tr class="border-t border-slate-100">
                     <td class="p-3"><?= e((string) $row['name']) ?></td>
                     <td class="p-3"><?= e((string) ($row['contact_person'] ?? '-')) ?></td>
@@ -63,6 +61,16 @@ ob_start();
         </table>
     </div>
 </section>
+<script>
+(() => {
+    if (!window.OxygenFinance?.onUpdated) return;
+    window.OxygenFinance.onUpdated(() => {
+        if (document.visibilityState === 'visible') {
+            window.location.reload();
+        }
+    });
+})();
+</script>
 <?php
 $content = ob_get_clean();
 render_layout('Supplier List', $content);

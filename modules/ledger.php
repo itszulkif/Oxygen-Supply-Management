@@ -326,18 +326,11 @@ $customerIds = array_values(array_unique(array_map(static fn ($id): int => (int)
 $ids = $customerIds;
 $matchedCustomerCount = count($ids);
 if ($ids !== []) {
-        $invoiceTotalExpr = column_exists($pdo, 'invoices', 'total_amount') ? 'COALESCE(total_amount, 0)' : 'COALESCE(grand_total, 0)';
         $ph = implode(',', array_fill(0, count($ids), '?'));
-        $dueSt = $pdo->prepare("SELECT customer_id, COALESCE(SUM({$invoiceTotalExpr}),0) AS due_payment, COALESCE(SUM(remaining_amount),0) AS remaining_balance FROM invoices WHERE customer_id IN ($ph) GROUP BY customer_id");
-        $dueSt->execute($ids);
-        foreach ($dueSt->fetchAll() as $row) {
-            $cid = (int) $row['customer_id'];
-            $customerDueMap[$cid] = [
-                'due_payment' => (float) $row['due_payment'],
-                'remaining_balance' => (float) $row['remaining_balance'],
-            ];
-            $customerSummary['due'] += (float) $row['due_payment'];
-            $customerSummary['remaining'] += (float) $row['remaining_balance'];
+        $customerDueMap = customer_ledger_due_map_for_ids($pdo, $ids);
+        foreach ($customerDueMap as $due) {
+            $customerSummary['due'] += (float) ($due['due_payment'] ?? 0);
+            $customerSummary['remaining'] += (float) ($due['remaining_balance'] ?? 0);
         }
 
         if ($customerSearch !== '') {
@@ -384,15 +377,8 @@ if ($ids !== []) {
     }
 
 if ($export === 'customer_csv') {
-    $invoiceTotalExpr = column_exists($pdo, 'invoices', 'total_amount') ? 'COALESCE(total_amount, 0)' : 'COALESCE(grand_total, 0)';
-    $dueMap = [];
-    $dueSt = $pdo->query("SELECT customer_id, COALESCE(SUM({$invoiceTotalExpr}),0) AS due_payment, COALESCE(SUM(remaining_amount),0) AS remaining_balance FROM invoices GROUP BY customer_id");
-    foreach ($dueSt->fetchAll() as $row) {
-        $dueMap[(int) $row['customer_id']] = [
-            'due_payment' => (float) $row['due_payment'],
-            'remaining_balance' => (float) $row['remaining_balance'],
-        ];
-    }
+    $allCustomerIds = array_map(static fn ($id): int => (int) $id, $pdo->query('SELECT id FROM customers')->fetchAll(PDO::FETCH_COLUMN));
+    $dueMap = customer_ledger_due_map_for_ids($pdo, $allCustomerIds);
 
     $ledgerCols = 'l.customer_id, l.date, l.debit, l.credit, l.balance';
     if (column_exists($pdo, 'ledger', 'description')) {
@@ -683,7 +669,16 @@ ob_start();
             if ($emptyMessage !== null): ?>
                 <tr><td colspan="10" class="p-4 text-slate-500"><?= e($emptyMessage) ?></td></tr>
             <?php endif; ?>
-            <?php foreach ($customerLedgerRows as $row): $due = $customerDueMap[(int) ($row['customer_id'] ?? 0)] ?? ['due_payment' => 0.0, 'remaining_balance' => 0.0]; ?>
+            <?php foreach ($customerLedgerRows as $row):
+                $due = $customerDueMap[(int) ($row['customer_id'] ?? 0)] ?? [
+                    'due_payment' => 0.0,
+                    'remaining_balance' => 0.0,
+                    'status_code' => 'Paid',
+                    'status_label' => payment_status_label('Paid'),
+                    'status_text_class' => 'text-emerald-600 font-semibold',
+                    'status_show_amount' => false,
+                ];
+            ?>
                 <tr data-row="true" class="border-t border-slate-100">
                     <td class="p-3 text-start align-middle whitespace-nowrap"><?= e(format_date_pk((string) $row['date'])) ?></td>
                     <td class="p-3 text-start align-middle"><?= e((string) $row['customer_name']) ?></td>
@@ -698,8 +693,12 @@ ob_start();
                     <td data-value="<?= (float) $row['credit'] ?>" class="p-3 text-end align-middle tabular-nums"><?= e(format_currency((float) $row['credit'])) ?></td>
                     <td class="p-3 text-end align-middle tabular-nums"><?= e(format_currency((float) $due['due_payment'])) ?></td>
                     <td class="p-3 text-end align-middle tabular-nums">
-                        <span class="<?= (float) $due['remaining_balance'] > 0 ? 'text-amber-600 font-semibold' : 'text-emerald-600 font-semibold' ?>">
-                            <?= (float) $due['remaining_balance'] > 0 ? e(__('status.due')) . ' ' . e(format_currency((float) $due['remaining_balance'])) : e(__('status.paid')) ?>
+                        <span class="<?= e((string) ($due['status_text_class'] ?? 'text-amber-600 font-semibold')) ?>">
+                            <?php if (!empty($due['status_show_amount'])): ?>
+                                <?= e((string) ($due['status_label'] ?? payment_status_label('Due'))) ?> <?= e(format_currency((float) $due['remaining_balance'])) ?>
+                            <?php else: ?>
+                                <?= e((string) ($due['status_label'] ?? payment_status_label('Paid'))) ?>
+                            <?php endif; ?>
                         </span>
                     </td>
                     <td class="p-3 text-end align-middle whitespace-nowrap">

@@ -45,6 +45,68 @@ function format_date_pk(?string $date): string
     return date('d/m/Y', $ts);
 }
 
+function format_datetime_pk(?string $datetime): string
+{
+    if (!$datetime) {
+        return '-';
+    }
+    $ts = strtotime($datetime);
+    if ($ts === false) {
+        return $datetime;
+    }
+
+    return date('d/m/Y H:i', $ts);
+}
+
+/** Sortable occurred-at timestamp (prefers DB created_at, else date + stable id offset). */
+function financial_transaction_occurred_at(string $dateYmd, mixed $createdAt, int $refId): string
+{
+    if ($createdAt !== null && $createdAt !== '') {
+        $ts = strtotime((string) $createdAt);
+        if ($ts !== false) {
+            return date('Y-m-d H:i:s', $ts);
+        }
+    }
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $dateYmd)) {
+        $dateYmd = date('Y-m-d');
+    }
+    $seconds = max(0, min(86399, $refId % 86400));
+
+    return $dateYmd . ' ' . gmdate('H:i:s', $seconds);
+}
+
+/** @param array<string, mixed> $tx */
+function financial_enrich_transaction_row(array $tx): array
+{
+    $refId = (int) ($tx['ref_id'] ?? 0);
+    $date = (string) ($tx['date'] ?? '');
+    $occurredAt = financial_transaction_occurred_at($date, $tx['created_at'] ?? null, $refId);
+    $tx['occurred_at'] = $occurredAt;
+    $tx['time_formatted'] = format_datetime_pk($occurredAt);
+    $tx['date_formatted'] = format_date_pk($date);
+
+    return $tx;
+}
+
+/**
+ * @param list<array<string, mixed>> $transactions
+ * @return list<array<string, mixed>>
+ */
+function financial_sort_transactions_timeline(array $transactions): array
+{
+    $rows = array_map('financial_enrich_transaction_row', $transactions);
+    usort($rows, static function (array $a, array $b): int {
+        $cmp = strcmp((string) ($b['occurred_at'] ?? ''), (string) ($a['occurred_at'] ?? ''));
+        if ($cmp !== 0) {
+            return $cmp;
+        }
+
+        return (int) ($b['ref_id'] ?? 0) <=> (int) ($a['ref_id'] ?? 0);
+    });
+
+    return $rows;
+}
+
 function payment_status_from_amounts(float $total, float $paid): string
 {
     if ($paid >= $total && $total > 0) {
@@ -64,6 +126,117 @@ function payment_status_label(string $status): string
         'Due' => __('status.due'),
         default => $status,
     };
+}
+
+/**
+ * Customer-level settlement status (orders + opening balance) for ledger list UI.
+ *
+ * @return array{
+ *   code: string,
+ *   label: string,
+ *   class: string,
+ *   text_class: string,
+ *   show_amount: bool
+ * }
+ */
+function customer_settlement_status_display(PDO $pdo, int $customerId, float $receivable): array
+{
+    if ($receivable <= 0.00001) {
+        return [
+            'code' => 'Paid',
+            'label' => payment_status_label('Paid'),
+            'class' => 'status-paid',
+            'text_class' => 'text-emerald-600 font-semibold',
+            'show_amount' => false,
+        ];
+    }
+    $credited = 0.0;
+    if ($customerId > 0 && table_exists($pdo, 'ledger')) {
+        $st = $pdo->prepare('SELECT COALESCE(SUM(credit), 0) FROM ledger WHERE customer_id = ?');
+        $st->execute([$customerId]);
+        $credited = (float) $st->fetchColumn();
+    }
+    $code = $credited > 0.00001 ? 'Partial' : 'Due';
+
+    return [
+        'code' => $code,
+        'label' => payment_status_label($code),
+        'class' => $code === 'Partial' ? 'status-partial' : 'status-due',
+        'text_class' => 'text-amber-600 font-semibold',
+        'show_amount' => true,
+    ];
+}
+
+/**
+ * Per-customer due figures for the customer ledger list (includes opening balance in outstanding).
+ *
+ * @param list<int> $customerIds
+ * @return array<int, array{
+ *   due_payment: float,
+ *   invoice_remaining: float,
+ *   remaining_balance: float,
+ *   status_code: string,
+ *   status_label: string,
+ *   status_class: string,
+ *   status_text_class: string,
+ *   status_show_amount: bool
+ * }>
+ */
+function customer_ledger_due_map_for_ids(PDO $pdo, array $customerIds): array
+{
+    $map = [];
+    foreach ($customerIds as $id) {
+        $cid = (int) $id;
+        if ($cid <= 0) {
+            continue;
+        }
+        $map[$cid] = [
+            'due_payment' => 0.0,
+            'invoice_remaining' => 0.0,
+            'remaining_balance' => 0.0,
+            'status_code' => 'Paid',
+            'status_label' => payment_status_label('Paid'),
+            'status_class' => 'status-paid',
+            'status_text_class' => 'text-emerald-600 font-semibold',
+            'status_show_amount' => false,
+        ];
+    }
+    if ($map === []) {
+        return [];
+    }
+    if (table_exists($pdo, 'invoices')) {
+        $invoiceTotalExpr = column_exists($pdo, 'invoices', 'total_amount')
+            ? 'COALESCE(total_amount, 0)'
+            : 'COALESCE(grand_total, 0)';
+        $ph = implode(',', array_fill(0, count($map), '?'));
+        $dueSt = $pdo->prepare(
+            "SELECT customer_id, COALESCE(SUM({$invoiceTotalExpr}), 0) AS due_payment,
+                    COALESCE(SUM(remaining_amount), 0) AS invoice_remaining
+             FROM invoices WHERE customer_id IN ($ph) GROUP BY customer_id"
+        );
+        $dueSt->execute(array_keys($map));
+        foreach ($dueSt->fetchAll() as $row) {
+            $cid = (int) ($row['customer_id'] ?? 0);
+            if ($cid <= 0 || !isset($map[$cid])) {
+                continue;
+            }
+            $map[$cid]['due_payment'] = (float) ($row['due_payment'] ?? 0);
+            $map[$cid]['invoice_remaining'] = (float) ($row['invoice_remaining'] ?? 0);
+        }
+    }
+    $receivableMap = customer_receivable_map($pdo, array_keys($map));
+    foreach (array_keys($map) as $cid) {
+        $receivable = (float) ($receivableMap[$cid]['receivable'] ?? 0);
+        $status = customer_settlement_status_display($pdo, $cid, $receivable);
+        $map[$cid]['remaining_balance'] = $receivable;
+        $map[$cid]['status_code'] = $status['code'];
+        $map[$cid]['status_label'] = $status['label'];
+        $map[$cid]['status_class'] = $status['class'];
+        $map[$cid]['status_text_class'] = $status['text_class'];
+        $map[$cid]['status_show_amount'] = $status['show_amount'];
+    }
+
+    return $map;
 }
 
 function dashboard_counts(): array
@@ -125,19 +298,64 @@ function column_exists(PDO $pdo, string $tableName, string $columnName): bool
     }
 }
 
-/** Sum of previous-balance / opening liabilities owed to all suppliers (AFN). */
+/** Sum of opening-balance liabilities still owed to all suppliers (AFN), after opening-only payments. */
 function supplier_opening_liability_sum(PDO $pdo): float
 {
     if (!table_exists($pdo, 'suppliers') || !column_exists($pdo, 'suppliers', 'opening_balance')) {
         return 0.0;
     }
-    return max(0.0, (float) $pdo->query('SELECT COALESCE(SUM(opening_balance), 0) FROM suppliers')->fetchColumn());
+    if (!table_exists($pdo, 'supplier_payments')) {
+        return max(0.0, (float) $pdo->query('SELECT COALESCE(SUM(opening_balance), 0) FROM suppliers')->fetchColumn());
+    }
+    $sql = 'SELECT COALESCE(SUM(GREATEST(0, s.opening_balance - COALESCE(op.paid, 0))), 0)
+            FROM suppliers s
+            LEFT JOIN (
+                SELECT supplier_id, SUM(amount) AS paid
+                FROM supplier_payments
+                WHERE transaction_id IS NULL OR transaction_id = 0
+                GROUP BY supplier_id
+            ) op ON op.supplier_id = s.id';
+
+    return max(0.0, (float) $pdo->query($sql)->fetchColumn());
 }
 
 /** Amount still owed to one supplier: opening liability + purchases − payments. */
 function supplier_amount_owed(float $openingBalance, float $purchases, float $paid): float
 {
     return max(0.0, $openingBalance + $purchases - $paid);
+}
+
+/** Per-supplier balance still owed (opening remaining + unpaid purchase balances). */
+function supplier_outstanding_balance(PDO $pdo, int $supplierId): float
+{
+    if ($supplierId <= 0) {
+        return 0.0;
+    }
+    $openingRemaining = supplier_opening_balance_remaining($pdo, $supplierId);
+    if (table_exists($pdo, 'supplier_transactions') && column_exists($pdo, 'supplier_transactions', 'remaining_amount')) {
+        $st = $pdo->prepare(
+            'SELECT COALESCE(SUM(remaining_amount), 0)
+             FROM supplier_transactions
+             WHERE supplier_id = ? AND remaining_amount > 0.00001'
+        );
+        $st->execute([$supplierId]);
+
+        return max(0.0, $openingRemaining + (float) $st->fetchColumn());
+    }
+    $purchases = 0.0;
+    $paid = 0.0;
+    if (table_exists($pdo, 'supplier_transactions')) {
+        $st = $pdo->prepare('SELECT COALESCE(SUM(total_amount), 0) FROM supplier_transactions WHERE supplier_id = ?');
+        $st->execute([$supplierId]);
+        $purchases = (float) $st->fetchColumn();
+    }
+    if (table_exists($pdo, 'supplier_payments')) {
+        $st = $pdo->prepare('SELECT COALESCE(SUM(amount), 0) FROM supplier_payments WHERE supplier_id = ?');
+        $st->execute([$supplierId]);
+        $paid = (float) $st->fetchColumn();
+    }
+
+    return supplier_amount_owed($openingRemaining, $purchases, $paid);
 }
 
 /** Cash paid against supplier opening balance only (not linked to a purchase). */
@@ -329,6 +547,45 @@ function customer_account_snapshot_for_ui(PDO $pdo, int $customerId): array
     ]);
 }
 
+/**
+ * Global opening-balance and opening-baqi totals for the customers list KPIs.
+ *
+ * @return array{
+ *   opening_balance_total: float,
+ *   opening_cylinders_total: int,
+ *   opening_balance_formatted: string,
+ *   opening_cylinders_formatted: string
+ * }
+ */
+function customers_global_opening_totals(PDO $pdo): array
+{
+    $balanceTotal = 0.0;
+    $cylindersTotal = 0;
+    if (table_exists($pdo, 'customers')) {
+        $ids = $pdo->query('SELECT id FROM customers')->fetchAll(PDO::FETCH_COLUMN);
+        foreach ($ids as $rawId) {
+            $cid = (int) $rawId;
+            if ($cid <= 0) {
+                continue;
+            }
+            $snap = customer_account_snapshot($pdo, $cid);
+            if ((float) ($snap['opening_balance'] ?? 0) > 0.00001) {
+                $balanceTotal += max(0.0, (float) ($snap['opening_balance_remaining'] ?? 0));
+            }
+            if ((int) ($snap['opening_cylinders'] ?? 0) > 0) {
+                $cylindersTotal += max(0, (int) ($snap['opening_cylinders_remaining'] ?? 0));
+            }
+        }
+    }
+
+    return [
+        'opening_balance_total' => $balanceTotal,
+        'opening_cylinders_total' => $cylindersTotal,
+        'opening_balance_formatted' => format_currency($balanceTotal),
+        'opening_cylinders_formatted' => (string) $cylindersTotal,
+    ];
+}
+
 /** Dashboard / global figures after payments (reads live DB). */
 function financial_system_pulse(PDO $pdo, ?string $cashLogFrom = null, ?string $cashLogTo = null): array
 {
@@ -336,11 +593,15 @@ function financial_system_pulse(PDO $pdo, ?string $cashLogFrom = null, ?string $
     $todayReceived = financial_net_received_for_range($pdo, $todayYmd, $todayYmd);
     $totalReceivedAllTime = financial_total_received_all_time($pdo);
 
+    $supplierPending = supplier_global_pending_payments($pdo);
+
     $pulse = [
         'today_received' => $todayReceived,
         'today_received_formatted' => format_currency($todayReceived),
         'total_received_all_time' => $totalReceivedAllTime,
         'total_received_all_time_formatted' => format_currency($totalReceivedAllTime),
+        'supplier_pending' => $supplierPending,
+        'supplier_pending_formatted' => format_currency($supplierPending),
     ];
 
     if ($cashLogFrom !== null && $cashLogTo !== null && $cashLogFrom !== '' && $cashLogTo !== '') {
@@ -454,7 +715,7 @@ function supplier_global_pending_payments(PDO $pdo): float
     $opening = supplier_opening_liability_sum($pdo);
     if (table_exists($pdo, 'supplier_transactions') && column_exists($pdo, 'supplier_transactions', 'remaining_amount')) {
         $remaining = (float) $pdo->query(
-            'SELECT COALESCE(SUM(remaining_amount), 0) FROM supplier_transactions WHERE remaining_amount > 0'
+            'SELECT COALESCE(SUM(remaining_amount), 0) FROM supplier_transactions WHERE remaining_amount > 0.00001'
         )->fetchColumn();
         return max(0.0, $opening + $remaining);
     }
@@ -530,6 +791,258 @@ function ensure_financial_expense_tables(PDO $pdo): void
     ");
 }
 
+/**
+ * Cash Book health filter: today, current week (Mon–today), current month (1st–today),
+ * or a specific calendar month via YYYY-MM (full month, capped at today for the current month).
+ *
+ * @return array{from: string, to: string, period: string, month: string}
+ */
+function financial_health_period_range(string $period, ?string $monthKey = null): array
+{
+    $monthKey = trim((string) $monthKey);
+    if ($monthKey !== '' && preg_match('/^\d{4}-\d{2}$/', $monthKey)) {
+        $start = DateTimeImmutable::createFromFormat('Y-m-d', $monthKey . '-01');
+        if ($start) {
+            $today = new DateTimeImmutable('today');
+            if ($start <= $today) {
+                $end = $start->modify('last day of this month');
+                if ($end > $today) {
+                    $end = $today;
+                }
+
+                return [
+                    'from' => $start->format('Y-m-d'),
+                    'to' => $end->format('Y-m-d'),
+                    'period' => 'month',
+                    'month' => $monthKey,
+                ];
+            }
+        }
+    }
+
+    $period = in_array($period, ['today', 'week', 'month'], true) ? $period : 'month';
+    $to = new DateTimeImmutable('today');
+    if ($period === 'today') {
+        $from = $to;
+    } elseif ($period === 'week') {
+        $from = $to->modify('monday this week');
+    } else {
+        $from = $to->modify('first day of this month');
+    }
+
+    return [
+        'from' => $from->format('Y-m-d'),
+        'to' => $to->format('Y-m-d'),
+        'period' => $period,
+        'month' => '',
+    ];
+}
+
+/** @return list<array{value: string, label: string}> last N calendar months (YYYY-MM), newest first */
+function financial_health_month_options(int $count = 24): array
+{
+    $count = max(1, min(60, $count));
+    $today = new DateTimeImmutable('today');
+    $cursor = $today->modify('first day of this month');
+    $out = [];
+    for ($i = 0; $i < $count; $i++) {
+        $value = $cursor->format('Y-m');
+        $out[] = [
+            'value' => $value,
+            'label' => financial_bucket_label($cursor->format('Y-m-d'), 'month'),
+        ];
+        $cursor = $cursor->modify('-1 month');
+    }
+
+    return $out;
+}
+
+/**
+ * @return array{
+ *   revenue: float,
+ *   purchases: float,
+ *   expenses: float,
+ *   salaries: float,
+ *   net: float,
+ *   revenue_formatted: string,
+ *   purchases_formatted: string,
+ *   expenses_formatted: string,
+ *   salaries_formatted: string,
+ *   net_formatted: string,
+ *   net_tone: string
+ * }
+ */
+function financial_health_summary(PDO $pdo, string $from, string $to): array
+{
+    $revenue = financial_gross_inflow_for_range($pdo, $from, $to);
+    $purchases = financial_sum_supplier_purchases_total($pdo, $from, $to);
+    $expenses = array_sum(financial_sum_by_date($pdo, 'general_expenses', 'expense_date', 'amount', $from, $to));
+    $salaries = array_sum(financial_sum_by_date($pdo, 'employee_salaries', 'salary_date', 'amount', $from, $to));
+    $net = $revenue - $purchases - $expenses - $salaries;
+
+    return [
+        'revenue' => $revenue,
+        'purchases' => $purchases,
+        'expenses' => $expenses,
+        'salaries' => $salaries,
+        'net' => $net,
+        'revenue_formatted' => format_currency($revenue),
+        'purchases_formatted' => format_currency($purchases),
+        'expenses_formatted' => format_currency($expenses),
+        'salaries_formatted' => format_currency($salaries),
+        'net_formatted' => format_currency($net),
+        'net_tone' => $net >= -0.00001 ? 'emerald' : 'rose',
+    ];
+}
+
+/** Payments against supplier previous balance owed (supplier_payments with no purchase row). */
+function financial_sum_supplier_opening_payments_total(PDO $pdo, string $from, string $to): float
+{
+    if (!table_exists($pdo, 'supplier_payments')) {
+        return 0.0;
+    }
+    $st = $pdo->prepare(
+        'SELECT COALESCE(SUM(amount), 0)
+         FROM supplier_payments
+         WHERE transaction_id IS NULL
+           AND payment_date >= ? AND payment_date <= ?'
+    );
+    $st->execute([$from, $to]);
+
+    return (float) $st->fetchColumn();
+}
+
+/** @return array<string, float> date Y-m-d => opening-balance payment total */
+function financial_sum_supplier_opening_payments_by_date(PDO $pdo, string $from, string $to): array
+{
+    if (!table_exists($pdo, 'supplier_payments')) {
+        return [];
+    }
+    $st = $pdo->prepare(
+        'SELECT payment_date AS d, COALESCE(SUM(amount), 0) AS t
+         FROM supplier_payments
+         WHERE transaction_id IS NULL
+           AND payment_date >= ? AND payment_date <= ?
+         GROUP BY payment_date'
+    );
+    $st->execute([$from, $to]);
+    $out = [];
+    foreach ($st->fetchAll() as $row) {
+        $out[(string) $row['d']] = (float) $row['t'];
+    }
+
+    return $out;
+}
+
+/** @return array<string, float> date Y-m-d => purchase total (refill purchases + opening-balance payments) */
+function financial_sum_supplier_purchases_by_date(PDO $pdo, string $from, string $to): array
+{
+    $out = [];
+    if (table_exists($pdo, 'supplier_transactions')) {
+        $st = $pdo->prepare(
+            'SELECT transaction_date AS d, COALESCE(SUM(total_amount), 0) AS t
+             FROM supplier_transactions
+             WHERE transaction_date >= ? AND transaction_date <= ?
+             GROUP BY transaction_date'
+        );
+        $st->execute([$from, $to]);
+        foreach ($st->fetchAll() as $row) {
+            $out[(string) $row['d']] = (float) $row['t'];
+        }
+    }
+    foreach (financial_sum_supplier_opening_payments_by_date($pdo, $from, $to) as $dateKey => $amount) {
+        $out[$dateKey] = ($out[$dateKey] ?? 0.0) + $amount;
+    }
+
+    return $out;
+}
+
+/**
+ * Last six calendar months of gross revenue vs total outflows (purchases + expenses + salaries).
+ *
+ * @return list<array{key: string, label: string, revenue: float, outflow: float, net: float}>
+ */
+function financial_health_monthly_chart_data(PDO $pdo): array
+{
+    $to = new DateTimeImmutable('today');
+    $from = $to->modify('first day of this month')->modify('-5 months');
+    $fromStr = $from->format('Y-m-d');
+    $toStr = $to->format('Y-m-d');
+
+    $inflowBy = financial_sum_total_inflow_by_date($pdo, $fromStr, $toStr);
+    $purchaseBy = financial_sum_supplier_purchases_by_date($pdo, $fromStr, $toStr);
+    $expenseBy = financial_sum_by_date($pdo, 'general_expenses', 'expense_date', 'amount', $fromStr, $toStr);
+    $salaryBy = financial_sum_by_date($pdo, 'employee_salaries', 'salary_date', 'amount', $fromStr, $toStr);
+
+    $keys = [];
+    $cursor = $from;
+    while ($cursor <= $to) {
+        $keys[] = $cursor->format('Y-m-01');
+        $cursor = $cursor->modify('first day of next month');
+    }
+
+    $out = [];
+    foreach ($keys as $monthKey) {
+        $monthStart = new DateTimeImmutable($monthKey);
+        $monthEnd = $monthStart->modify('last day of this month');
+        if ($monthEnd > $to) {
+            $monthEnd = $to;
+        }
+        $revenue = 0.0;
+        $outflow = 0.0;
+        $day = $monthStart;
+        while ($day <= $monthEnd) {
+            $d = $day->format('Y-m-d');
+            $revenue += (float) ($inflowBy[$d] ?? 0);
+            $outflow += (float) ($purchaseBy[$d] ?? 0)
+                + (float) ($expenseBy[$d] ?? 0)
+                + (float) ($salaryBy[$d] ?? 0);
+            $day = $day->modify('+1 day');
+        }
+        $out[] = [
+            'key' => $monthKey,
+            'label' => financial_bucket_label($monthKey, 'month'),
+            'revenue' => $revenue,
+            'outflow' => $outflow,
+            'net' => $revenue - $outflow,
+        ];
+    }
+
+    return $out;
+}
+
+/**
+ * Daily revenue vs outflows for a selected Cash Book date range (chart follows active filter).
+ *
+ * @return list<array{label: string, revenue: float, outflow: float}>
+ */
+function financial_health_chart_data(PDO $pdo, string $from, string $to): array
+{
+    $inflowBy = financial_sum_total_inflow_by_date($pdo, $from, $to);
+    $purchaseBy = financial_sum_supplier_purchases_by_date($pdo, $from, $to);
+    $expenseBy = financial_sum_by_date($pdo, 'general_expenses', 'expense_date', 'amount', $from, $to);
+    $salaryBy = financial_sum_by_date($pdo, 'employee_salaries', 'salary_date', 'amount', $from, $to);
+
+    $cursor = new DateTimeImmutable($from);
+    $end = new DateTimeImmutable($to);
+    $out = [];
+    while ($cursor <= $end) {
+        $d = $cursor->format('Y-m-d');
+        $revenue = (float) ($inflowBy[$d] ?? 0);
+        $outflow = (float) ($purchaseBy[$d] ?? 0)
+            + (float) ($expenseBy[$d] ?? 0)
+            + (float) ($salaryBy[$d] ?? 0);
+        $out[] = [
+            'label' => format_date_pk($d),
+            'revenue' => $revenue,
+            'outflow' => $outflow,
+        ];
+        $cursor = $cursor->modify('+1 day');
+    }
+
+    return $out;
+}
+
 /** Cash book inflows (opening capital and other manual entries). */
 function financial_sum_cash_inflow_by_date(PDO $pdo, string $from, string $to): array
 {
@@ -588,7 +1101,7 @@ function financial_customer_opening_cash_transactions(PDO $pdo, string $from, st
     }
     $openingDesc = __('ledger.payment_opening_settlement');
     $st = $pdo->prepare(
-        "SELECT l.id, l.date AS tx_date, l.credit AS amount, l.description, c.name AS customer_name
+        "SELECT l.id, l.date AS tx_date, l.created_at, l.credit AS amount, l.description, c.name AS customer_name
          FROM ledger l
          INNER JOIN customers c ON c.id = l.customer_id
          WHERE l.date >= ? AND l.date <= ?
@@ -610,6 +1123,7 @@ function financial_customer_opening_cash_transactions(PDO $pdo, string $from, st
         }
         $rows[] = [
             'date' => (string) $r['tx_date'],
+            'created_at' => (string) ($r['created_at'] ?? ''),
             'type' => 'inflow_customer_opening',
             'type_label' => __('dashboard.tx_type_customer_opening_payment'),
             'description' => $desc . ' — ' . (string) ($r['customer_name'] ?? ''),
@@ -634,7 +1148,7 @@ function financial_customer_opening_recorded_transactions(PDO $pdo, string $from
         return [];
     }
     $st = $pdo->prepare(
-        "SELECT l.id, l.date AS tx_date, l.debit AS amount, l.description, c.name AS customer_name
+        "SELECT l.id, l.date AS tx_date, l.created_at, l.debit AS amount, l.description, c.name AS customer_name
          FROM ledger l
          INNER JOIN customers c ON c.id = l.customer_id
          WHERE l.date >= ? AND l.date <= ?
@@ -649,6 +1163,7 @@ function financial_customer_opening_recorded_transactions(PDO $pdo, string $from
         $amount = (float) ($r['amount'] ?? 0);
         $rows[] = [
             'date' => (string) $r['tx_date'],
+            'created_at' => (string) ($r['created_at'] ?? ''),
             'type' => 'customer_opening_recorded',
             'type_label' => __('dashboard.tx_type_customer_opening_recorded'),
             'description' => __('dashboard.tx_customer_opening_recorded_desc', [
@@ -698,20 +1213,21 @@ function financial_gross_inflow_for_range(PDO $pdo, string $from, string $to): f
     return $total;
 }
 
-/** Supplier purchase expense total for a date range (supplier_transactions.total_amount). */
+/** Supplier purchases for a date range: refill totals plus payments on previous balance owed. */
 function financial_sum_supplier_purchases_total(PDO $pdo, string $from, string $to): float
 {
-    if (!table_exists($pdo, 'supplier_transactions')) {
-        return 0.0;
+    $total = 0.0;
+    if (table_exists($pdo, 'supplier_transactions')) {
+        $st = $pdo->prepare(
+            'SELECT COALESCE(SUM(total_amount), 0)
+             FROM supplier_transactions
+             WHERE transaction_date >= ? AND transaction_date <= ?'
+        );
+        $st->execute([$from, $to]);
+        $total += (float) $st->fetchColumn();
     }
-    $st = $pdo->prepare(
-        'SELECT COALESCE(SUM(total_amount), 0)
-         FROM supplier_transactions
-         WHERE transaction_date >= ? AND transaction_date <= ?'
-    );
-    $st->execute([$from, $to]);
 
-    return (float) $st->fetchColumn();
+    return $total + financial_sum_supplier_opening_payments_total($pdo, $from, $to);
 }
 
 /** Received payments net of supplier cash paid out (payments) for the range. */
@@ -741,7 +1257,7 @@ function financial_supplier_purchase_transactions(PDO $pdo, string $from, string
         return [];
     }
     $st = $pdo->prepare(
-        'SELECT t.id, t.transaction_date AS tx_date, t.total_amount AS amount, s.name AS supplier_name
+        'SELECT t.id, t.transaction_date AS tx_date, t.created_at, t.total_amount AS amount, s.name AS supplier_name
          FROM supplier_transactions t
          INNER JOIN suppliers s ON s.id = t.supplier_id
          WHERE t.transaction_date >= ? AND t.transaction_date <= ?
@@ -754,6 +1270,7 @@ function financial_supplier_purchase_transactions(PDO $pdo, string $from, string
         $refId = (int) ($r['id'] ?? 0);
         $rows[] = [
             'date' => (string) $r['tx_date'],
+            'created_at' => (string) ($r['created_at'] ?? ''),
             'type' => 'outflow_supplier_purchase',
             'type_label' => __('dashboard.tx_type_supplier_purchase'),
             'description' => 'PUR-' . $refId . ' — ' . (string) ($r['supplier_name'] ?? ''),
@@ -765,6 +1282,82 @@ function financial_supplier_purchase_transactions(PDO $pdo, string $from, string
     }
 
     return $rows;
+}
+
+/**
+ * @return array{
+ *   items: list<array<string, mixed>>,
+ *   pagination: array{total: int, page: int, per_page: int, total_pages: int},
+ *   summary: array{in: float, out: float, net: float, in_formatted: string, out_formatted: string, net_formatted: string, total: int}
+ * }
+ */
+function financial_build_cash_log_feed(
+    PDO $pdo,
+    string $from,
+    string $to,
+    string $type,
+    string $direction,
+    string $q,
+    int $page,
+    int $perPage
+): array {
+    $all = financial_overview_transactions($pdo, $from, $to);
+    $filtered = financial_filter_transactions($all, [
+        'type' => $type,
+        'direction' => $direction,
+        'q' => $q,
+    ]);
+    $pagination = financial_paginate_transactions($filtered, $page, $perPage);
+    $in = 0.0;
+    $out = 0.0;
+    foreach ($filtered as $tx) {
+        $in += (float) ($tx['inflow'] ?? 0);
+        $out += (float) ($tx['outflow'] ?? 0);
+    }
+
+    return [
+        'items' => $pagination['items'],
+        'pagination' => [
+            'total' => $pagination['total'],
+            'page' => $pagination['page'],
+            'per_page' => $pagination['per_page'],
+            'total_pages' => $pagination['total_pages'],
+        ],
+        'summary' => [
+            'in' => $in,
+            'out' => $out,
+            'net' => $in - $out,
+            'in_formatted' => format_currency($in),
+            'out_formatted' => format_currency($out),
+            'net_formatted' => format_currency($in - $out),
+            'total' => $pagination['total'],
+        ],
+    ];
+}
+
+/**
+ * @param list<array<string, mixed>> $items
+ * @return list<array<string, mixed>>
+ */
+function financial_cash_log_feed_json_items(array $items): array
+{
+    $out = [];
+    foreach ($items as $tx) {
+        $out[] = [
+            'type' => (string) ($tx['type'] ?? ''),
+            'type_label' => (string) ($tx['type_label'] ?? ''),
+            'description' => (string) ($tx['description'] ?? ''),
+            'time_formatted' => (string) ($tx['time_formatted'] ?? ''),
+            'date_formatted' => (string) ($tx['date_formatted'] ?? format_date_pk((string) ($tx['date'] ?? ''))),
+            'inflow' => (float) ($tx['inflow'] ?? 0),
+            'outflow' => (float) ($tx['outflow'] ?? 0),
+            'inflow_formatted' => (float) ($tx['inflow'] ?? 0) > 0 ? format_currency((float) $tx['inflow']) : '',
+            'outflow_formatted' => (float) ($tx['outflow'] ?? 0) > 0 ? format_currency((float) $tx['outflow']) : '',
+            'ref_id' => (int) ($tx['ref_id'] ?? 0),
+        ];
+    }
+
+    return $out;
 }
 
 /**
@@ -893,7 +1486,7 @@ function financial_overview_transactions(PDO $pdo, string $from, string $to): ar
     $rows = [];
     if (table_exists($pdo, 'payments')) {
         $st = $pdo->prepare(
-            'SELECT p.id, p.payment_date AS tx_date, p.amount,
+            'SELECT p.id, p.payment_date AS tx_date, p.created_at, p.amount,
                 COALESCE(s.id, 0) AS service_id, c.name AS customer_name
              FROM payments p
              INNER JOIN invoices i ON i.id = p.invoice_id
@@ -909,6 +1502,7 @@ function financial_overview_transactions(PDO $pdo, string $from, string $to): ar
             $refId = (int) $r['id'];
             $rows[] = [
                 'date' => (string) $r['tx_date'],
+                'created_at' => (string) ($r['created_at'] ?? ''),
                 'type' => 'inflow_order',
                 'type_label' => __('dashboard.tx_type_order_payment'),
                 'description' => $label . ' â€” ' . (string) ($r['customer_name'] ?? ''),
@@ -927,7 +1521,7 @@ function financial_overview_transactions(PDO $pdo, string $from, string $to): ar
     );
     if (table_exists($pdo, 'supplier_payments')) {
         $st = $pdo->prepare(
-            'SELECT sp.id, sp.payment_date AS tx_date, sp.amount, sp.transaction_id, s.name AS supplier_name
+            'SELECT sp.id, sp.payment_date AS tx_date, sp.created_at, sp.amount, sp.transaction_id, s.name AS supplier_name
              FROM supplier_payments sp
              INNER JOIN suppliers s ON s.id = sp.supplier_id
              WHERE sp.payment_date >= ? AND sp.payment_date <= ?
@@ -938,6 +1532,7 @@ function financial_overview_transactions(PDO $pdo, string $from, string $to): ar
             $refId = (int) $r['id'];
             $rows[] = [
                 'date' => (string) $r['tx_date'],
+                'created_at' => (string) ($r['created_at'] ?? ''),
                 'type' => 'outflow_supplier',
                 'type_label' => __('dashboard.tx_type_supplier'),
                 'description' => 'SP-' . (int) ($r['transaction_id'] ?? 0) . ' â€” ' . (string) ($r['supplier_name'] ?? ''),
@@ -950,7 +1545,7 @@ function financial_overview_transactions(PDO $pdo, string $from, string $to): ar
     }
     if (table_exists($pdo, 'general_expenses')) {
         $st = $pdo->prepare(
-            'SELECT id, expense_date AS tx_date, amount, description, category
+            'SELECT id, expense_date AS tx_date, created_at, amount, description, category
              FROM general_expenses
              WHERE expense_date >= ? AND expense_date <= ?
              ORDER BY expense_date DESC, id DESC'
@@ -960,6 +1555,7 @@ function financial_overview_transactions(PDO $pdo, string $from, string $to): ar
             $refId = (int) $r['id'];
             $rows[] = [
                 'date' => (string) $r['tx_date'],
+                'created_at' => (string) ($r['created_at'] ?? ''),
                 'type' => 'outflow_expense',
                 'type_label' => __('dashboard.tx_type_expense'),
                 'description' => (string) ($r['description'] ?? '') . ' (' . (string) ($r['category'] ?? '') . ')',
@@ -972,7 +1568,7 @@ function financial_overview_transactions(PDO $pdo, string $from, string $to): ar
     }
     if (table_exists($pdo, 'employee_salaries')) {
         $st = $pdo->prepare(
-            'SELECT id, salary_date AS tx_date, amount, employee_name
+            'SELECT id, salary_date AS tx_date, created_at, amount, employee_name
              FROM employee_salaries
              WHERE salary_date >= ? AND salary_date <= ?
              ORDER BY salary_date DESC, id DESC'
@@ -982,6 +1578,7 @@ function financial_overview_transactions(PDO $pdo, string $from, string $to): ar
             $refId = (int) $r['id'];
             $rows[] = [
                 'date' => (string) $r['tx_date'],
+                'created_at' => (string) ($r['created_at'] ?? ''),
                 'type' => 'outflow_salary',
                 'type_label' => __('dashboard.tx_type_salary'),
                 'description' => __('dashboard.tx_salary_for') . ' ' . (string) ($r['employee_name'] ?? ''),
@@ -994,7 +1591,7 @@ function financial_overview_transactions(PDO $pdo, string $from, string $to): ar
     }
     if (table_exists($pdo, 'cash_transactions')) {
         $st = $pdo->prepare(
-            'SELECT id, transaction_date AS tx_date, inflow, outflow, category, description, is_opening
+            'SELECT id, transaction_date AS tx_date, created_at, inflow, outflow, category, description, is_opening
              FROM cash_transactions
              WHERE transaction_date >= ? AND transaction_date <= ?
              ORDER BY transaction_date DESC, id DESC'
@@ -1016,6 +1613,7 @@ function financial_overview_transactions(PDO $pdo, string $from, string $to): ar
             }
             $rows[] = [
                 'date' => (string) $r['tx_date'],
+                'created_at' => (string) ($r['created_at'] ?? ''),
                 'type' => $type,
                 'type_label' => match ($type) {
                     'inflow_opening' => __('dashboard.tx_type_opening'),
@@ -1030,11 +1628,8 @@ function financial_overview_transactions(PDO $pdo, string $from, string $to): ar
             ];
         }
     }
-    usort($rows, static function (array $a, array $b): int {
-        $cmp = strcmp($b['date'], $a['date']);
-        return $cmp !== 0 ? $cmp : ($b['ref_id'] <=> $a['ref_id']);
-    });
-    return $rows;
+
+    return financial_sort_transactions_timeline($rows);
 }
 
 /**
